@@ -238,6 +238,35 @@ def generate_final_videos(
             params=params,
         )
 
+        # 可选：叠加解剖学角标图（合谷穴、足三里等穴位科普视频用）。
+        # 触发条件：config.app.anatomy_overlay_image 指向已存在的 PNG 文件。
+        # 输出文件用 .with-overlay.mp4 后缀，不破坏原 final-N.mp4。
+        anatomy_overlay_image = str(
+            config.app.get("anatomy_overlay_image", "") or ""
+        ).strip()
+        if anatomy_overlay_image and os.path.isfile(anatomy_overlay_image):
+            overlay_output = path.join(
+                utils.task_dir(task_id), f"final-{index}-overlay.mp4"
+            )
+            try:
+                video.apply_anatomy_overlay(
+                    input_video=final_video_path,
+                    output_video=overlay_output,
+                    overlay_image=anatomy_overlay_image,
+                    position=str(
+                        config.app.get("anatomy_overlay_position", "bottom-right")
+                    ),
+                    scale=float(config.app.get("anatomy_overlay_scale", 0.18)),
+                    margin=int(config.app.get("anatomy_overlay_margin", 24)),
+                )
+                logger.info(f"anatomy overlay applied: {overlay_output}")
+                # 让 WebUI 拿到的就是带角标的版本
+                final_video_path = overlay_output
+            except Exception as overlay_error:
+                logger.warning(
+                    f"anatomy overlay failed, fallback to plain video: {overlay_error}"
+                )
+
         _progress += 50 / params.video_count / 2
         sm.state.update_task(task_id, progress=_progress)
 

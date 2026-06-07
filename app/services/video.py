@@ -793,6 +793,99 @@ def _rounded_subtitle_background_clip(
     return ImageClip(np.array(img), transparent=True)
 
 
+# 解剖学角标叠加（faster than moviepy，无 re-encode 全程）
+# 用法：apply_anatomy_overlay(input.mp4, output.mp4, "anatomy.png", position="bottom-right", scale=0.18)
+_OVERLAY_POSITIONS = {
+    "top-left":     "10:10",
+    "top-right":    "W-w-10:10",
+    "bottom-left":  "10:H-h-10",
+    "bottom-right": "W-w-10:H-h-10",
+    "center":       "(W-w)/2:(H-h)/2",
+}
+
+
+def _get_overlay_position_expr(position: str, margin: int) -> str:
+    """根据 position 字符串返回 ffmpeg overlay 表达式的 x:y 部分。"""
+    template = _OVERLAY_POSITIONS.get(position, _OVERLAY_POSITIONS["bottom-right"])
+    # 替换占位符为实际 margin
+    return template.replace("10", str(margin))
+
+
+def apply_anatomy_overlay(
+    input_video: str,
+    output_video: str,
+    overlay_image: str,
+    position: str = "bottom-right",
+    scale: float = 0.18,
+    margin: int = 24,
+) -> str:
+    """
+    在视频右下角（或其它位置）叠加一张透明 PNG（解剖学图 / 穴位标记图等）。
+
+    Args:
+        input_video:   输入 mp4 路径
+        output_video:  输出 mp4 路径（生成）
+        overlay_image: 透明 PNG 路径
+        position:      top-left / top-right / bottom-left / bottom-right / center
+        scale:         叠加图相对视频宽度的比例，默认 0.18（~9:16 视频下约 194px 宽）
+        margin:        距离视频边缘的像素
+
+    Returns:
+        输出视频路径
+    """
+    if not os.path.exists(input_video):
+        raise FileNotFoundError(f"input video not found: {input_video}")
+    if not os.path.exists(overlay_image):
+        raise FileNotFoundError(f"overlay image not found: {overlay_image}")
+
+    ffmpeg_binary = utils.get_ffmpeg_binary()
+    pos_expr = _get_overlay_position_expr(position, margin)
+
+    # 1) 探测视频分辨率
+    probe_cmd = [
+        ffmpeg_binary, "-hide_banner", "-i", input_video,
+    ]
+    probe_result = subprocess.run(
+        probe_cmd, capture_output=True, text=True, check=False, timeout=30,
+    )
+    video_w, video_h = 1080, 1920
+    for line in (probe_result.stderr or "").splitlines():
+        if "Stream #0:0" in line and "Video:" in line:
+            import re
+            m = re.search(r"(\d{3,5})x(\d{3,5})", line)
+            if m:
+                video_w, video_h = int(m.group(1)), int(m.group(2))
+                break
+
+    overlay_w = max(int(video_w * scale), 64)
+    logger.info(
+        f"apply_anatomy_overlay: input={input_video}, video={video_w}x{video_h}, "
+        f"overlay={overlay_image}, position={position}, scale={scale} -> {overlay_w}px"
+    )
+
+    # 2) 用 ffmpeg overlay filter 把图缩到指定宽度，叠在四角之一
+    # 视频和图都按 H.264 + yuv420p 重编码。libx264 是项目默认编码器。
+    cmd = [
+        ffmpeg_binary, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", input_video,
+        "-i", overlay_image,
+        "-filter_complex",
+        f"[1:v]scale={overlay_w}:-1[ovrl];"
+        f"[0:v][ovrl]overlay={pos_expr}:format=auto",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", "-preset", "medium",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        output_video,
+    ]
+    logger.info(f"ffmpeg overlay cmd: {' '.join(cmd)}")
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=600)
+    if proc.returncode != 0:
+        logger.error(f"anatomy overlay failed: {proc.stderr}")
+        raise RuntimeError(f"ffmpeg overlay failed: {proc.stderr}")
+    logger.info(f"anatomy overlay done: {output_video}")
+    return output_video
+
+
 def generate_video(
     video_path: str,
     audio_path: str,

@@ -694,20 +694,53 @@ def generate_script(
 
 def generate_terms(video_subject: str, video_script: str, amount: int = 5) -> List[str]:
     prompt = f"""
-# Role: Video Search Terms Generator
+# Role: Video Search Terms Generator for stock-video sites (Pexels / Pixabay)
 
 ## Goals:
-Generate {amount} search terms for stock videos, depending on the subject of a video.
+Generate {amount} English search terms that will be fed directly to a stock-video
+search API. The result of the search is then randomly concatenated behind a
+voice-over, so the visual scenes need to *match the script semantically* and
+*return enough footage* (>=3 short clips per term on Pexels).
 
-## Constrains:
-1. the search terms are to be returned as a json-array of strings.
-2. each search term should consist of 1-3 words, always add the main subject of the video.
-3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
-4. the search terms must be related to the subject of the video.
-5. reply with english search terms only.
+## Hard constraints:
+1. Output must be a JSON array of strings, nothing else (no markdown, no commentary).
+2. Each term is 1-3 English words describing a CONCRETE VISUAL SCENE — not an
+   abstract medical / scientific / philosophical concept. Pexels indexes video
+   by what the camera sees, not by what the video "is about".
+3. AVOID pure jargon like "Hegu acupoint" / "TCM" / "qi" / "meridian" /
+   "yin-yang" — Pexels returns <10 hits and the clips are usually unrelated
+   B-roll. Translate the concept into something the camera can actually see.
+4. PREFER scene vocabulary that Pexels has thousands of clips for: close up
+   hands, slow motion, wellness, spa, massage, asian woman, herbal, tea
+   steam, bamboo, nature, meditation, sunrise, etc.
+5. For traditional / oriental / wellness subjects specifically, prefer the
+   visual hook over the medical name. e.g. for "合谷穴 massage" return terms
+   like "hand close up", "finger pressure massage", "wellness spa" — NOT
+   "Hegu acupoint", "LI4 point", "acupressure meridian".
+6. At least 2 of the {amount} terms must be GENERIC visual scenes
+   (e.g. "close up hands", "slow motion nature", "wellness spa stones")
+   so the random cut always has good B-roll even when the topic is niche.
+7. The remaining terms can be topic-specific but must be visual:
+   e.g. for headache relief use "woman holding head", not "headache etiology".
+8. English only. Lowercase, no quotes inside strings.
 
-## Output Example:
-["search term 1", "search term 2", "search term 3","search term 4","search term 5"]
+## Few-shot examples:
+
+### Input subject: "四总穴之合谷穴" (Hegu acupoint massage tutorial)
+### Output:
+["hand close up", "finger pressure massage", "wellness spa stones", "asian woman relaxing", "herbal tea steam"]
+
+### Input subject: "Python tutorial: list comprehensions"
+### Output:
+["typing on keyboard", "code on screen", "developer working", "laptop close up", "coffee and notebook"]
+
+### Input subject: "Cherry blossom season in Tokyo"
+### Output:
+["cherry blossom close up", "tokyo street slow motion", "japanese garden", "spring breeze petals", "asian woman walking"]
+
+### Input subject: "牙疼怎么办" (how to relieve toothache)
+### Output:
+["woman holding cheek pain", "close up teeth", "dentist clinic", "herbal tea calm", "asian woman relaxing"]
 
 ## Context:
 ### Video Subject
@@ -716,7 +749,7 @@ Generate {amount} search terms for stock videos, depending on the subject of a v
 ### Video Script
 {video_script}
 
-Please note that you must use English for generating video search terms; Chinese is not accepted.
+Now generate the {amount} visual search terms as a JSON array. English only.
 """.strip()
 
     logger.info(f"subject: {video_subject}")
