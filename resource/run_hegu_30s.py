@@ -38,4 +38,5 @@ if __name__ == "__main__":
         overlay_position="bottom-right",
         overlay_scale=0.18,
         video_clip_duration=3,
+        check=True,  # 跑完自动抽 5 帧拼 preview.jpg，目视验证
     )

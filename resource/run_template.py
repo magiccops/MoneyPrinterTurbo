@@ -49,9 +49,125 @@ from app.models.schema import (
 )
 from app.services import video, voice
 
+# 抽帧校验默认抽 5 帧（覆盖 30s 视频），时长 < 15s 自动减到 3 帧
+_CHECK_FRAME_COUNTS = [(30, 5), (15, 4), (0, 3)]
+_CHECK_FRAME_ASPECT = 0.56  # 9:16 portrait 视频的宽高比 (1080/1920)
+_CHECK_THUMB_W = 320
+
 
 # 最小素材文件大小（字节），< 500KB 多为 Pexels 404 假文件
 _MIN_CLIP_BYTES = 500_000
+
+
+def _probe_duration(video_path: str) -> float:
+    """用 ffprobe 拿视频时长，失败返回 0.0。"""
+    import json
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "json", video_path,
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return float(json.loads(result.stdout)["format"]["duration"])
+    except Exception as e:
+        logger.warning(f"ffprobe failed for {video_path}: {e}")
+    return 0.0
+
+
+def _check_video(video_path: str, output_dir: str) -> str | None:
+    """抽 5 帧拼成 1x5 grid 输出 PNG，给用户目视验证视频质量。
+
+    时长 < 30s 自动减帧（< 15s → 3 帧；15~30s → 4 帧；>= 30s → 5 帧）。
+    抽帧时间点均匀分布，避开首尾 0.5s 和 0.5s 之前（拼接切点常见的位置）。
+    """
+    import subprocess
+    from PIL import Image, ImageDraw, ImageFont
+
+    duration = _probe_duration(video_path)
+    if duration <= 0:
+        logger.warning("cannot probe duration, skip --check")
+        return None
+
+    n_frames = 3
+    for threshold, count in _CHECK_FRAME_COUNTS:
+        if duration >= threshold:
+            n_frames = count
+            break
+
+    # 均匀分布时间点：留 0.5s buffer 在首尾
+    margin = min(1.0, duration * 0.1)
+    span = max(0.1, duration - 2 * margin)
+    timestamps = [margin + span * (i + 0.5) / n_frames for i in range(n_frames)]
+
+    logger.info(f"[check] duration={duration:.2f}s, sampling {n_frames} frames at {[f'{t:.1f}' for t in timestamps]}")
+
+    preview_dir = os.path.join(output_dir, "preview")
+    os.makedirs(preview_dir, exist_ok=True)
+
+    frame_paths: list[tuple[float, str]] = []
+    for i, t in enumerate(timestamps):
+        frame_path = os.path.join(preview_dir, f"frame_{int(t)}s.jpg")
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-loglevel", "error",
+                    "-ss", f"{t:.2f}", "-i", video_path,
+                    "-vframes", "1", frame_path,
+                ],
+                check=True, timeout=30,
+            )
+            frame_paths.append((t, frame_path))
+        except Exception as e:
+            logger.warning(f"failed to extract frame at {t:.1f}s: {e}")
+
+    if not frame_paths:
+        logger.error("[check] no frames extracted")
+        return None
+
+    # 拼 1xN grid（横排便于手机/桌面看）
+    THUMB_W = _CHECK_THUMB_W
+    THUMB_H = int(THUMB_W / _CHECK_FRAME_ASPECT)
+    PAD = 8
+    LABEL_H = 24
+
+    W = len(frame_paths) * THUMB_W + (len(frame_paths) + 1) * PAD
+    H = THUMB_H + LABEL_H + 2 * PAD
+    canvas = Image.new("RGB", (W, H), "white")
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14
+        )
+    except Exception:
+        font = ImageFont.load_default()
+
+    for i, (t, fp) in enumerate(frame_paths):
+        x = PAD + i * (THUMB_W + PAD)
+        try:
+            img = Image.open(fp).convert("RGB")
+            img.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
+            canvas.paste(img, (x, PAD))
+        except Exception as e:
+            logger.warning(f"failed to paste frame at {t:.1f}s: {e}")
+        draw.rectangle(
+            [(x, PAD + THUMB_H), (x + THUMB_W, PAD + THUMB_H + LABEL_H)],
+            fill="#222",
+        )
+        draw.text(
+            (x + 6, PAD + THUMB_H + 4), f"{t:.0f}s",
+            fill="white", font=font,
+        )
+
+    preview_path = os.path.join(output_dir, "preview.jpg")
+    canvas.save(preview_path, quality=85)
+    logger.success(f"[check] preview saved: {preview_path} ({os.path.getsize(preview_path)//1024} KB, {W}x{H})")
+    return preview_path
 
 
 def _build_materials(clips_dir: str) -> list[MaterialInfo]:
@@ -122,8 +238,13 @@ def run(
     overlay_margin: int = 24,
     video_clip_duration: int = 3,
     font_name: str = "MicrosoftYaHeiBold.ttc",
+    check: bool = False,
 ) -> str:
-    """跑一条端到端短视频，返回最终产物路径。"""
+    """跑一条端到端短视频，返回最终产物路径。
+
+    check=True 时，跑完视频后自动抽 3-5 帧拼成 preview.jpg 到 output_dir/，
+    便于用户目视验证（解决"抽帧只看 0.5s 看不出来主体缺失"的问题）。
+    """
     if os.path.exists(output_dir):
         shutil.rmtree(output_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -221,6 +342,12 @@ def run(
 
     size = os.path.getsize(final_path)
     logger.success(f"done: {final_path} ({size // 1024} KB)")
+
+    if check:
+        preview = _check_video(final_path, output_dir)
+        if preview:
+            print(f"\nPREVIEW: {preview}")
+
     return final_path
 
 
@@ -245,6 +372,10 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--font-name", default="MicrosoftYaHeiBold.ttc", help="字体文件名"
+    )
+    p.add_argument(
+        "--check", action="store_true",
+        help="跑完视频后自动抽 3-5 帧拼成 preview.jpg 到 output_dir/，目视验证"
     )
     return p.parse_args()
 
@@ -272,6 +403,7 @@ def main() -> None:
         overlay_margin=args.overlay_margin,
         video_clip_duration=args.video_clip_duration,
         font_name=args.font_name,
+        check=args.check,
     )
 
 
