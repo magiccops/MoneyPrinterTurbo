@@ -225,6 +225,47 @@ def save_video(video_url: str, save_dir: str = "") -> str:
     return ""
 
 
+# 当 LLM 生成的搜索词在 Pexels 0 命中时（niche 主题常见），用这组通用场景词兜底。
+# 这些词在 Pexels 都 ≥500+ 库存，可以保证 B-roll 不断档。
+_FALLBACK_SEARCH_TERMS = [
+    "close up hands",
+    "slow motion nature",
+    "wellness spa",
+    "asian woman relaxing",
+    "herbal tea steam",
+    "sunrise nature",
+]
+# 低于此阈值触发 fallback
+_FALLBACK_MIN_ITEMS = 3
+
+
+def _try_fallback_search(
+    search_videos,
+    search_terms: List[str],
+    seen_urls: List[str],
+    max_clip_duration: int,
+    video_aspect,
+) -> List[MaterialInfo]:
+    """用通用词补足素材，去重后返回追加的 MaterialInfo。"""
+    added: List[MaterialInfo] = []
+    for term in _FALLBACK_SEARCH_TERMS:
+        if term in search_terms:
+            continue  # 已在原 terms 里，避免重复搜
+        video_items = search_videos(
+            search_term=term,
+            minimum_duration=max_clip_duration,
+            video_aspect=video_aspect,
+        )
+        logger.info(f"[fallback] '{term}' returned {len(video_items)} videos")
+        for item in video_items:
+            if item.url not in seen_urls:
+                added.append(item)
+                seen_urls.append(item.url)
+        if len(added) >= _FALLBACK_MIN_ITEMS:
+            break
+    return added
+
+
 def download_videos(
     task_id: str,
     search_terms: List[str],
@@ -254,6 +295,24 @@ def download_videos(
                 valid_video_items.append(item)
                 valid_video_urls.append(item.url)
                 found_duration += item.duration
+
+    # Fallback: 总命中数太少时用通用词补足，避免任务因素材不够短于音频而 break。
+    if len(valid_video_items) < _FALLBACK_MIN_ITEMS:
+        logger.warning(
+            f"only {len(valid_video_items)} videos found from primary terms, "
+            f"triggering fallback with generic scenes"
+        )
+        fallback_items = _try_fallback_search(
+            search_videos=search_videos,
+            search_terms=search_terms,
+            seen_urls=valid_video_urls,
+            max_clip_duration=max_clip_duration,
+            video_aspect=video_aspect,
+        )
+        for item in fallback_items:
+            valid_video_items.append(item)
+            found_duration += item.duration
+        logger.info(f"after fallback: {len(valid_video_items)} total videos")
 
     logger.info(
         f"found total videos: {len(valid_video_items)}, required duration: {audio_duration} seconds, found duration: {found_duration} seconds"
