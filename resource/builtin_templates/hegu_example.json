@@ -1,0 +1,74 @@
+{
+  "name": "合谷穴示例",
+  "type": "template",
+  "created_ts": "2026-06-14 19:30",
+  "_comment": "首次启动时由 resource/scene_store.py 复制到 storage/scenes/templates/。id 字段每次加载会被 webui 替换成新 uuid，避免 widget key 冲突。",
+  "scenes": [
+    {
+      "id": "scene1-intro",
+      "type": "text",
+      "title": "合谷穴",
+      "body": "面口合谷收",
+      "bg_color": "#0F2A4A",
+      "title_color": "#FFD700",
+      "body_color": "#FFFFFF",
+      "accent_color": "#FF6B6B",
+      "title_size": 140,
+      "body_size": 72
+    },
+    {
+      "id": "scene2-position",
+      "type": "text",
+      "title": "位置",
+      "body": "手背第1、2掌骨间\n拇指食指并拢\n肌肉最高点",
+      "bg_color": "#5C0F1A",
+      "title_color": "#FFFFFF",
+      "body_color": "#FFFFFF",
+      "accent_color": "#FFD700",
+      "title_size": 140,
+      "body_size": 72
+    },
+    {
+      "id": "scene3-anatomy",
+      "type": "image",
+      "file_path": "/MoneyPrinterTurbo/resource/anatomy/hegu_full.png",
+      "original_name": "hegu_full.png"
+    },
+    {
+      "id": "scene4-benefits",
+      "type": "text",
+      "title": "功效",
+      "body": "牙痛  头痛\n咽喉肿痛  面瘫",
+      "bg_color": "#1A4A2E",
+      "title_color": "#FFFFFF",
+      "body_color": "#FFFFFF",
+      "accent_color": "#90EE90",
+      "title_size": 140,
+      "body_size": 72
+    },
+    {
+      "id": "scene5-method",
+      "type": "text",
+      "title": "按压",
+      "body": "拇指指腹按压\n力度以酸胀为宜\n每次3-5分钟",
+      "bg_color": "#0F2A4A",
+      "title_color": "#FFD700",
+      "body_color": "#FFFFFF",
+      "accent_color": "#FF6B6B",
+      "title_size": 140,
+      "body_size": 72
+    },
+    {
+      "id": "scene6-warning",
+      "type": "text",
+      "title": "注意",
+      "body": "孕妇慎用\n以免引起子宫收缩",
+      "bg_color": "#3A0F0F",
+      "title_color": "#FFFFFF",
+      "body_color": "#FFFFFF",
+      "accent_color": "#FF4444",
+      "title_size": 140,
+      "body_size": 72
+    }
+  ]
+}

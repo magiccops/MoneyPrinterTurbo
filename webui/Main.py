@@ -16,6 +16,11 @@ if root_dir not in sys.path:
     print(sys.path)
     print("")
 
+# resource/ 目录不是 Python package，但里面有 text_card.py 这种脚本式模块可被 WebUI 复用
+resource_dir = os.path.join(root_dir, "resource")
+if resource_dir not in sys.path:
+    sys.path.append(resource_dir)
+
 from app.config import config
 from app.models.schema import (
     MaterialInfo,
@@ -28,6 +33,11 @@ from app.services import llm, voice
 from app.services import task as tm
 from app.utils import utils
 from webui import history as history_store
+from text_card import render_text_card, render_text_card_thumbnail
+from scene_store import (
+    list_templates, load_template, save_template, delete_template,
+    list_drafts, load_draft, save_draft, delete_draft,
+)
 
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
@@ -84,6 +94,12 @@ if "selected_history_id" not in st.session_state:
 if "history_just_restored" not in st.session_state:
     # 防止 radio on_change 触发时立刻把 session_state 写回去形成循环。
     st.session_state["history_just_restored"] = None
+if "custom_scenes" not in st.session_state:
+    # 「🎬 场景编排」面板里用户排好的场景列表，每条是一个 dict（含 id/type/参数）
+    st.session_state["custom_scenes"] = []
+if "custom_scenes_enabled" not in st.session_state:
+    # 是否启用场景编排；启用时提交会覆盖 video_source="local" + video_materials
+    st.session_state["custom_scenes_enabled"] = False
 
 # 加载语言文件
 locales = utils.load_locales(i18n_dir)
@@ -148,6 +164,349 @@ def _render_history_sidebar() -> None:
 
 
 _render_history_sidebar()
+# ─────────────────────────────────────────────────────────────────────
+
+
+# ── 🎬 场景编排实现 ────────────────────────────────────────────────────
+# 数据模型：st.session_state["custom_scenes"] = list[dict]
+# 每条 dict 至少含 {id, type, ...}，详情见 plan。
+SCENE_DEFAULT_TEXT = {
+    "title": "合谷穴",
+    "body": "面口合谷收",
+    "bg_color": "#0F2A4A",
+    "title_color": "#FFD700",
+    "body_color": "#FFFFFF",
+    "accent_color": "#FF6B6B",
+    "title_size": 140,
+    "body_size": 72,
+}
+SCENE_DEFAULT_IMAGE = {
+    "file_path": "",
+    "original_name": "",
+}
+LOCAL_VIDEOS_DIR_FOR_SCENES = os.path.join(root_dir, "storage", "local_videos")
+
+
+def _new_scene_id() -> str:
+    return str(uuid4())
+
+
+def _delete_scene_files(scene: dict) -> None:
+    """删除场景关联的产物文件（text 渲染的 PNG / image 上传的源文件）。"""
+    for key in ("rendered_path", "file_path"):
+        p = scene.get(key)
+        if p and os.path.isfile(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def _render_scene_thumbnail(scene: dict) -> None:
+    """在 scene 卡片内显示缩略图：文字卡实时渲染 200×356；图片直接预览。"""
+    if scene["type"] == "text":
+        try:
+            thumb_path = os.path.join(
+                "/tmp", f"scene_{scene['id']}_thumb.png"
+            )
+            render_text_card_thumbnail(
+                thumb_path,
+                title=scene.get("title", ""),
+                body=scene.get("body", ""),
+                bg_color=scene.get("bg_color", "#0F2A4A"),
+                title_color=scene.get("title_color", "#FFD700"),
+                body_color=scene.get("body_color", "#FFFFFF"),
+                accent_color=scene.get("accent_color", "#FF6B6B"),
+                title_size=int(scene.get("title_size", 140)),
+                body_size=int(scene.get("body_size", 72)),
+            )
+            st.image(thumb_path, width=180, caption="缩略图预览（自动）")
+        except Exception as e:
+            st.caption(f"⚠️ 缩略图渲染失败: {e}")
+    elif scene["type"] == "image":
+        fp = scene.get("file_path", "")
+        if fp and os.path.isfile(fp):
+            try:
+                st.image(fp, width=180, caption=scene.get("original_name", ""))
+            except Exception as e:
+                st.caption(f"⚠️ 图片预览失败: {e}")
+        else:
+            st.caption("📷 尚未上传图片")
+
+
+def _render_scene_card(scene: dict, idx: int, total: int) -> None:
+    """渲染单张 scene 卡片（在场景编排 expander 内）。"""
+    with st.container(border=True):
+        # 标题行：[N] 类型标签 · 名称 | ↑ ↓ 🗑️
+        type_label = "文字" if scene["type"] == "text" else "图片"
+        if scene["type"] == "text":
+            name = (scene.get("title") or "(无标题)").strip()[:20] or "(无标题)"
+        else:
+            name = scene.get("original_name") or "(未上传)"
+        header = f"[{idx + 1}] {type_label} · {name}"
+        hcol1, hcol2, hcol3, hcol4 = st.columns([6, 1, 1, 1])
+        with hcol1:
+            st.markdown(f"**{header}**")
+        with hcol2:
+            if st.button("↑", key=f"scene_{scene['id']}_up", disabled=(idx == 0), use_container_width=True):
+                scenes = st.session_state["custom_scenes"]
+                scenes[idx - 1], scenes[idx] = scenes[idx], scenes[idx - 1]
+                st.rerun()
+        with hcol3:
+            if st.button("↓", key=f"scene_{scene['id']}_down", disabled=(idx == total - 1), use_container_width=True):
+                scenes = st.session_state["custom_scenes"]
+                scenes[idx + 1], scenes[idx] = scenes[idx], scenes[idx + 1]
+                st.rerun()
+        with hcol4:
+            if st.button("🗑️", key=f"scene_{scene['id']}_del", use_container_width=True):
+                _delete_scene_files(scene)
+                st.session_state["custom_scenes"].pop(idx)
+                st.rerun()
+
+        # 类型切换（只允许 text / image）
+        new_type = st.selectbox(
+            "类型",
+            options=["text", "image"],
+            index=0 if scene["type"] == "text" else 1,
+            format_func=lambda x: "文字卡" if x == "text" else "图片",
+            key=f"scene_{scene['id']}_type",
+        )
+        if new_type != scene["type"]:
+            # 类型切换：删旧文件 + 初始化新字段
+            _delete_scene_files(scene)
+            scene["type"] = new_type
+            for k, v in (SCENE_DEFAULT_TEXT if new_type == "text" else SCENE_DEFAULT_IMAGE).items():
+                scene.setdefault(k, v)
+            st.rerun()
+
+        # 字段编辑
+        if scene["type"] == "text":
+            tcol1, tcol2 = st.columns([3, 2])
+            with tcol1:
+                scene["title"] = st.text_input(
+                    "标题",
+                    value=scene.get("title", ""),
+                    key=f"scene_{scene['id']}_title",
+                )
+                scene["body"] = st.text_area(
+                    "正文（\\n 强制换行 + 自动按宽换行）",
+                    value=scene.get("body", ""),
+                    key=f"scene_{scene['id']}_body",
+                    height=100,
+                )
+            with tcol2:
+                scene["bg_color"] = st.color_picker(
+                    "背景色",
+                    value=scene.get("bg_color", "#0F2A4A"),
+                    key=f"scene_{scene['id']}_bg",
+                )
+                scene["title_color"] = st.color_picker(
+                    "标题色",
+                    value=scene.get("title_color", "#FFD700"),
+                    key=f"scene_{scene['id']}_titlecolor",
+                )
+                scene["body_color"] = st.color_picker(
+                    "正文字色",
+                    value=scene.get("body_color", "#FFFFFF"),
+                    key=f"scene_{scene['id']}_bodycolor",
+                )
+                scene["accent_color"] = st.color_picker(
+                    "装饰条色",
+                    value=scene.get("accent_color", "#FF6B6B"),
+                    key=f"scene_{scene['id']}_accent",
+                )
+            scol1, scol2 = st.columns(2)
+            with scol1:
+                scene["title_size"] = st.slider(
+                    "标题字号",
+                    min_value=60, max_value=240, value=int(scene.get("title_size", 140)), step=10,
+                    key=f"scene_{scene['id']}_titlesize",
+                )
+            with scol2:
+                scene["body_size"] = st.slider(
+                    "正文字号",
+                    min_value=40, max_value=160, value=int(scene.get("body_size", 72)), step=4,
+                    key=f"scene_{scene['id']}_bodysize",
+                )
+        else:  # image
+            uploaded = st.file_uploader(
+                "上传图片 (jpg/jpeg/png)",
+                type=["jpg", "jpeg", "png", "JPG", "JPEG", "PNG"],
+                key=f"scene_{scene['id']}_upload",
+                accept_multiple_files=False,
+            )
+            if uploaded is not None and uploaded.name != scene.get("original_name"):
+                # 写盘到 storage/local_videos/scene_<id>_<name>（preprocess_video 白名单路径）
+                os.makedirs(LOCAL_VIDEOS_DIR_FOR_SCENES, exist_ok=True)
+                save_path = os.path.join(
+                    LOCAL_VIDEOS_DIR_FOR_SCENES, f"scene_{scene['id']}_{uploaded.name}"
+                )
+                with open(save_path, "wb") as f:
+                    f.write(uploaded.getbuffer())
+                # 旧文件清理
+                if scene.get("file_path") and scene["file_path"] != save_path:
+                    try:
+                        if os.path.isfile(scene["file_path"]):
+                            os.remove(scene["file_path"])
+                    except OSError:
+                        pass
+                scene["file_path"] = save_path
+                scene["original_name"] = uploaded.name
+                st.rerun()
+
+        # 缩略图预览
+        _render_scene_thumbnail(scene)
+
+
+def _render_scene_editor() -> None:
+    """在中面板 Video Settings container 末尾渲染「🎬 场景编排」expander。"""
+    scenes = st.session_state["custom_scenes"]
+    n = len(scenes)
+    with st.expander(f"🎬 场景编排 ({n})", expanded=False):
+        st.checkbox(
+            "启用场景编排（启用后将覆盖 Video Source）",
+            key="custom_scenes_enabled",
+            help="启用后，提交时会把下面这些场景渲染/拼成 video_materials，强制走 local 视频源。",
+        )
+
+        # ── 模板 / 草稿 I/O 子面板（默认折叠，干净） ──────────────
+        with st.expander("📚 模板 / 草稿", expanded=False):
+            _render_scene_io()
+
+        if not scenes:
+            st.caption("👇 点下方按钮添加第一张场景，或点上面「📚 模板 / 草稿」加载现成的。")
+        else:
+            st.caption("💡 调整字段时缩略图会自动重渲；提交时会用 1080×1920 全尺寸重渲一次。")
+            for i, sc in enumerate(list(scenes)):  # list() 防止中途修改
+                _render_scene_card(sc, i, n)
+
+        # 添加按钮
+        acol1, acol2 = st.columns(2)
+        with acol1:
+            if st.button("➕ 文字场景", key="add_text_scene", use_container_width=True):
+                new_sc = {"id": _new_scene_id(), "type": "text", **SCENE_DEFAULT_TEXT}
+                scenes.append(new_sc)
+                st.rerun()
+        with acol2:
+            if st.button("➕ 图片场景", key="add_image_scene", use_container_width=True):
+                new_sc = {"id": _new_scene_id(), "type": "image", **SCENE_DEFAULT_IMAGE}
+                scenes.append(new_sc)
+                st.rerun()
+
+
+# ── 场景 I/O 实现（template / draft 加载/保存） ─────────────────────
+def _refresh_scene_io_widgets() -> None:
+    """清掉 selectbox 等 widget 缓存，让列表刷新。"""
+    for k in (
+        "scene_io_tpl_sel", "scene_io_tpl_name",
+        "scene_io_draft_sel", "scene_io_draft_name",
+    ):
+        if k in st.session_state:
+            # 保留值，update 触发 list 变化后 widget 会重新渲染
+            pass
+
+
+def _render_scene_io() -> None:
+    """模板/草稿加载/保存 UI。放在 scene editor expander 内。"""
+    # ── 加载模板 ──
+    templates = list_templates()
+    st.caption(f"📋 内置 + 用户模板（{len(templates)} 个）")
+    tcol1, tcol2, tcol3 = st.columns([3, 1, 1])
+    with tcol1:
+        tpl_options = ["（选择模板）"] + [n for n, _ in templates]
+        tpl_sel = st.selectbox(
+            "加载模板", tpl_options, key="scene_io_tpl_sel", label_visibility="collapsed"
+        )
+    with tcol2:
+        if st.button("📥 加载", key="scene_io_tpl_load", use_container_width=True):
+            if tpl_sel and tpl_sel != "（选择模板）":
+                loaded = load_template(tpl_sel)
+                if loaded is not None:
+                    # 重新分配 id，避免 widget key 冲突（加载多次/不同模板会撞 key）
+                    for sc in loaded:
+                        sc["id"] = _new_scene_id()
+                    st.session_state["custom_scenes"] = loaded
+                    st.toast(f"已加载模板：{tpl_sel}（{len(loaded)} 张场景）")
+                    st.rerun()
+                else:
+                    st.error(f"加载失败：{tpl_sel}")
+    with tcol3:
+        if st.button("🗑️", key="scene_io_tpl_del", use_container_width=True,
+                     help="删除当前选中的模板"):
+            if tpl_sel and tpl_sel != "（选择模板）":
+                if delete_template(tpl_sel):
+                    st.toast(f"已删除模板：{tpl_sel}")
+                    st.rerun()
+
+    # ── 加载草稿 ──
+    drafts = list_drafts()
+    st.caption(f"📂 我的草稿（{len(drafts)} 个）")
+    dcol1, dcol2, dcol3 = st.columns([3, 1, 1])
+    with dcol1:
+        draft_options = ["（选择草稿）"] + [n for n, _ in drafts]
+        draft_sel = st.selectbox(
+            "加载草稿", draft_options, key="scene_io_draft_sel", label_visibility="collapsed"
+        )
+    with dcol2:
+        if st.button("📥 加载", key="scene_io_draft_load", use_container_width=True):
+            if draft_sel and draft_sel != "（选择草稿）":
+                loaded = load_draft(draft_sel)
+                if loaded is not None:
+                    for sc in loaded:
+                        sc["id"] = _new_scene_id()
+                    st.session_state["custom_scenes"] = loaded
+                    st.toast(f"已加载草稿：{draft_sel}（{len(loaded)} 张场景）")
+                    st.rerun()
+                else:
+                    st.error(f"加载失败：{draft_sel}")
+    with dcol3:
+        if st.button("🗑️", key="scene_io_draft_del", use_container_width=True,
+                     help="删除当前选中的草稿"):
+            if draft_sel and draft_sel != "（选择草稿）":
+                if delete_draft(draft_sel):
+                    st.toast(f"已删除草稿：{draft_sel}")
+                    st.rerun()
+
+    # ── 保存草稿 / 模板 ──
+    st.divider()
+    scol1, scol2 = st.columns(2)
+    with scol1:
+        st.text_input(
+            "草稿名（保存到 drafts/）",
+            key="scene_io_draft_name",
+            placeholder="如：合谷穴v2-尝试新配色",
+        )
+        if st.button("💾 保存草稿", key="scene_io_save_draft", use_container_width=True):
+            name = (st.session_state.get("scene_io_draft_name") or "").strip()
+            if not name:
+                st.error("请先在上方填草稿名")
+            elif not st.session_state.get("custom_scenes"):
+                st.error("当前场景列表为空，没有可保存的内容")
+            else:
+                save_draft(name, st.session_state["custom_scenes"])
+                st.toast(f"已保存草稿：{name}")
+                st.rerun()
+    with scol2:
+        st.text_input(
+            "模板名（保存到 templates/）",
+            key="scene_io_tpl_name",
+            placeholder="如：中医穴位-6张标准版",
+        )
+        if st.button("💾 保存为模板", key="scene_io_save_tpl", use_container_width=True):
+            name = (st.session_state.get("scene_io_tpl_name") or "").strip()
+            if not name:
+                st.error("请先在上方填模板名")
+            elif not st.session_state.get("custom_scenes"):
+                st.error("当前场景列表为空，没有可保存的内容")
+            else:
+                save_template(name, st.session_state["custom_scenes"])
+                st.toast(f"已保存模板：{name}")
+                st.rerun()
+
+
+
+
+
 # ─────────────────────────────────────────────────────────────────────
 
 # 创建一个顶部栏，包含标题和语言选择
@@ -1003,6 +1362,11 @@ with middle_panel:
                 help=tr("Video Encoder Help"),
             )
             config.app["video_codec"] = video_codec_options[selected_codec_index][1]
+
+        # ── 🎬 场景编排 ──────────────────────────────────────────────
+        # 用户手动排一个时间线（文字卡 + 图片），提交时覆盖 video_source="local"
+        # + video_materials=MaterialInfo 列表。不动 tm.start 内部。
+        _render_scene_editor()
     with st.container(border=True):
         st.write(tr("Audio Settings"))
 
@@ -1532,6 +1896,58 @@ if start_button:
             m.duration = material.get("duration", 0)
             if m.url:
                 params.video_materials.append(m)
+
+    # ── 启用「🎬 场景编排」→ 覆盖 video_source + video_materials ──────
+    # 渲染文字场景为 1080×1920 全尺寸 PNG（preprocess_video 走图片分支会做 Ken Burns）
+    # 之后强制 video_source="local"，按场景顺序拼。
+    if st.session_state.get("custom_scenes_enabled") and st.session_state.get("custom_scenes"):
+        _scene_paths = []
+        _local_videos_dir = utils.storage_dir("local_videos", create=True)
+        for _sc in st.session_state["custom_scenes"]:
+            if _sc.get("type") == "text":
+                _out = os.path.join(
+                    _local_videos_dir, f"scene_{_sc['id']}.png"
+                )
+                try:
+                    render_text_card(
+                        out_path=_out,
+                        title=_sc.get("title", ""),
+                        body=_sc.get("body", ""),
+                        bg_color=_sc.get("bg_color", "#0F2A4A"),
+                        title_color=_sc.get("title_color", "#FFD700"),
+                        body_color=_sc.get("body_color", "#FFFFFF"),
+                        accent_color=_sc.get("accent_color", "#FF6B6B"),
+                        width=1080,
+                        height=1920,
+                        title_size=int(_sc.get("title_size", 140)),
+                        body_size=int(_sc.get("body_size", 72)),
+                    )
+                    _sc["rendered_path"] = _out
+                    _scene_paths.append(_out)
+                except Exception as _e:
+                    logger.warning(f"scene text render failed: {_e}")
+            elif _sc.get("type") == "image":
+                _fp = _sc.get("file_path")
+                if _fp and os.path.isfile(_fp):
+                    _scene_paths.append(_fp)
+                else:
+                    logger.warning(
+                        f"image scene {_sc.get('id')[:8]} missing file, skipped"
+                    )
+        if not _scene_paths:
+            st.error("场景编排已启用但没有有效的场景，请先添加文字或图片场景")
+            scroll_to_bottom()
+            st.stop()
+        params.video_source = "local"
+        params.video_materials = [
+            MaterialInfo(provider="local", url=p) for p in _scene_paths
+        ]
+        # 保持用户排的顺序；金句卡与图的关系不能被打乱
+        params.video_concat_mode = VideoConcatMode.sequential.value
+        logger.info(
+            f"scene editor: {len(_scene_paths)} materials, "
+            f"forced video_source=local, concat=sequential"
+        )
 
     log_container = st.empty()
     log_records = []
