@@ -1,6 +1,7 @@
 import os
 import sys
 import webbrowser
+from datetime import datetime
 from uuid import UUID, uuid4
 
 import requests
@@ -26,6 +27,7 @@ from app.models.schema import (
 from app.services import llm, voice
 from app.services import task as tm
 from app.utils import utils
+from webui import history as history_store
 
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
@@ -76,9 +78,77 @@ if "ui_language" not in st.session_state:
 if "local_video_materials" not in st.session_state:
     # 记住用户最近一次已经落盘的本地素材，避免仅修改文案后二次生成时丢失素材列表。
     st.session_state["local_video_materials"] = []
+if "selected_history_id" not in st.session_state:
+    # 用户在左侧历史列表里点选的记录 id；用于把历史参数回填到主表单。
+    st.session_state["selected_history_id"] = None
+if "history_just_restored" not in st.session_state:
+    # 防止 radio on_change 触发时立刻把 session_state 写回去形成循环。
+    st.session_state["history_just_restored"] = None
 
 # 加载语言文件
 locales = utils.load_locales(i18n_dir)
+
+
+# ── 左侧历史列表 sidebar ──────────────────────────────────────────────
+# 每次执行任务后把 (id, ts, subject, status, videos, params) 追加到
+# storage/task_history.jsonl；点行后通过 selected_history_id 把参数
+# 回填到 session_state，让下方表单 widget 自动显示历史值。
+def _render_history_sidebar() -> None:
+    st.sidebar.markdown("### 📋 历史")
+
+    records = history_store.load_records(limit=30)
+    if st.sidebar.button("🗑️ 清空历史", key="clear_history_btn", use_container_width=True):
+        history_store.clear_all()
+        st.session_state["selected_history_id"] = None
+        st.session_state["history_just_restored"] = None
+        st.rerun()
+
+    if not records:
+        st.sidebar.caption("暂无历史记录。生成一次视频后会自动出现在这里。")
+        return
+
+    def _format(rec):
+        subject = (rec.get("subject") or "(无主题)").strip() or "(无主题)"
+        if len(subject) > 18:
+            subject = subject[:17] + "…"
+        icon = "✅" if rec.get("status") == "success" else "❌"
+        return f"{rec.get('ts', '')} · {subject} · {icon}"
+
+    # 关键：把 list[id] 算好稳定 index，方便 radio 用 index 跟踪。
+    record_ids = [r.get("id") for r in records]
+    current_id = st.session_state.get("selected_history_id")
+    if current_id in record_ids:
+        current_index = record_ids.index(current_id)
+    else:
+        current_index = None
+
+    def _on_select():
+        idx = st.session_state.get("history_radio")
+        if idx is None:
+            st.session_state["selected_history_id"] = None
+            return
+        # index → record id
+        try:
+            st.session_state["selected_history_id"] = record_ids[idx]
+        except (IndexError, TypeError):
+            st.session_state["selected_history_id"] = None
+
+    st.sidebar.radio(
+        "点选一条回填参数",
+        options=list(range(len(records))),
+        index=current_index,
+        format_func=lambda i: _format(records[i]),
+        key="history_radio",
+        on_change=_on_select,
+        label_visibility="collapsed",
+    )
+
+    if st.session_state.get("selected_history_id"):
+        st.sidebar.caption("✅ 已选中 — 主表单已回填下方参数")
+
+
+_render_history_sidebar()
+# ─────────────────────────────────────────────────────────────────────
 
 # 创建一个顶部栏，包含标题和语言选择
 title_col, lang_col = st.columns([3, 1])
@@ -656,6 +726,59 @@ if not config.app.get("hide_config", False):
             save_keys_to_config("pixabay_api_keys", pixabay_api_key)
 
 llm_provider = config.app.get("llm_provider", "").lower()
+
+
+# ── 历史回填 ──────────────────────────────────────────────────────────
+# 当用户在 sidebar 选中一条历史，把 params 全部写回 session_state；
+# 下面 widget 都用 key=，Streamlit 会自动从 session_state 读出最新值。
+if st.session_state.get("selected_history_id"):
+    _rec = history_store.get_record(st.session_state["selected_history_id"])
+    if _rec and isinstance(_rec.get("params"), dict):
+        for _k, _v in _rec["params"].items():
+            # 跳过 None / 复杂对象：widget key 期望的是 scalar 或简单 dict/list
+            if _v is None:
+                continue
+            try:
+                st.session_state[_k] = _v
+            except Exception:
+                pass
+        # 恢复 local_videos 路径缓存（与 line 1402 复用逻辑对应）
+        _vm = _rec["params"].get("video_materials")
+        if isinstance(_vm, list):
+            st.session_state["local_video_materials"] = _vm
+        # 恢复 custom_audio_file 路径（widget key 之外，但 form 渲染时 widget 会读）
+        if _rec["params"].get("custom_audio_file"):
+            st.session_state["custom_audio_file"] = _rec["params"]["custom_audio_file"]
+        st.session_state["history_just_restored"] = st.session_state["selected_history_id"]
+    # 一次性：消费掉，避免 rerun 反复覆盖用户当前编辑
+    st.session_state["selected_history_id"] = None
+
+
+# ── 历史视频预览 ──────────────────────────────────────────────────────
+# 回填后顺便在主区域顶部显示历史视频，让用户确认「这是我要的那条」。
+_restored_id = st.session_state.get("history_just_restored")
+if _restored_id:
+    _rec_for_preview = history_store.get_record(_restored_id)
+    if _rec_for_preview and _rec_for_preview.get("videos"):
+        with st.expander(
+            f"📼 历史视频预览 — {_rec_for_preview.get('ts','')} · "
+            f"{_rec_for_preview.get('subject','(无主题)')}",
+            expanded=True,
+        ):
+            for _url in _rec_for_preview["videos"][:3]:
+                try:
+                    if os.path.isfile(_url):
+                        st.video(_url)
+                    else:
+                        st.caption(f"⚠️ 视频文件已不在：{_url}")
+                except Exception:
+                    pass
+            if st.button("关闭预览", key="close_history_preview"):
+                st.session_state["history_just_restored"] = None
+                st.rerun()
+# ─────────────────────────────────────────────────────────────────────
+
+
 panel = st.columns(3)
 left_panel = panel[0]
 middle_panel = panel[1]
@@ -1431,6 +1554,20 @@ if start_button:
     if not result or "videos" not in result:
         st.error(tr("Video Generation Failed"))
         logger.error(tr("Video Generation Failed"))
+        # 失败也要落历史（status=failed），方便回看当时参数
+        try:
+            history_store.append_record(
+                {
+                    "id": task_id,
+                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "subject": (params.video_subject or "(无主题)").strip() or "(无主题)",
+                    "status": "failed",
+                    "videos": [],
+                    "params": params.model_dump(mode="json"),
+                }
+            )
+        except Exception as _h_err:
+            logger.warning(f"history append failed (error path): {_h_err}")
         scroll_to_bottom()
         st.stop()
 
@@ -1443,6 +1580,21 @@ if start_button:
                 player_cols[i * 2 + 1].video(url)
     except Exception:
         pass
+
+    # 写历史（status=success）
+    try:
+        history_store.append_record(
+            {
+                "id": task_id,
+                "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "subject": (params.video_subject or "(无主题)").strip() or "(无主题)",
+                "status": "success",
+                "videos": video_files,
+                "params": params.model_dump(mode="json"),
+            }
+        )
+    except Exception as _h_err:
+        logger.warning(f"history append failed: {_h_err}")
 
     open_task_folder(task_id)
     logger.info(tr("Video Generation Completed"))
