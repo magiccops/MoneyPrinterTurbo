@@ -2,8 +2,10 @@ x-common-volumes: &common-volumes
   - ./:/MoneyPrinterTurbo
 
 # 让容器走宿主机 Clash 7890 代理（国内直连，国外走代理）
+# 同时把容器时区设到上海，避免 loguru 日志和 datetime.now() 落 UTC（与北京时间差 8h）。
 x-common-proxy: &common-proxy
   environment:
+    TZ: "Asia/Shanghai"
     HTTP_PROXY: "http://192.168.1.20:7890"
     HTTPS_PROXY: "http://192.168.1.20:7890"
     NO_PROXY: "localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,172.17.0.0/16,172.18.0.0/16,172.19.0.0/16,172.20.0.0/16,.svc.cluster.local"

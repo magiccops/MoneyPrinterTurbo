@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import webbrowser
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -7,6 +8,16 @@ from uuid import UUID, uuid4
 import requests
 import streamlit as st
 from loguru import logger
+
+# 容器默认走 UTC，但日志和历史记录期望显示北京时间（UTC+8）。
+# 在 loguru 首次 format / 首次 datetime.now() 之前就把进程的本地时区切到上海，
+# 这样 {time:%Y-%m-%d %H:%M:%S} 和 datetime.now() 都拿到北京时间。
+# Windows 没有 time.tzset()，那边系统时区本来就不是 UTC，try/except 兜底。
+os.environ.setdefault("TZ", "Asia/Shanghai")
+try:
+    time.tzset()
+except (AttributeError, OSError):
+    pass
 
 # Add the root directory of the project to the system path to allow importing modules from the project
 root_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -1991,9 +2002,25 @@ if start_button:
     st.success(tr("Video Generation Completed"))
     try:
         if video_files:
-            player_cols = st.columns(len(video_files) * 2 + 1)
             for i, url in enumerate(video_files):
-                player_cols[i * 2 + 1].video(url)
+                # 视频 + 下载按钮并排显示；按钮读取本地文件后通过浏览器下载。
+                _dl_cols = st.columns([4, 1])
+                with _dl_cols[0]:
+                    st.video(url)
+                with _dl_cols[1]:
+                    try:
+                        with open(url, "rb") as _f:
+                            _video_bytes = _f.read()
+                        st.download_button(
+                            label="⬇️ 下载视频",
+                            data=_video_bytes,
+                            file_name=os.path.basename(url),
+                            mime="video/mp4",
+                            key=f"download_{task_id}_{i}",
+                            use_container_width=True,
+                        )
+                    except Exception as _dl_err:
+                        st.caption(f"⚠️ 下载失败: {_dl_err}")
     except Exception:
         pass
 

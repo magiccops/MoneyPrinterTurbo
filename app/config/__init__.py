@@ -1,10 +1,20 @@
 import os
 import sys
+import time
 
 from loguru import logger
 
 from app.config import config
 from app.utils import utils
+
+
+# 与 webui/Main.py 对齐：API 服务进程的本地时区也切到上海，避免 loguru 的 {time}
+# 与 datetime.now() 落 UTC。docker-compose 已加 TZ 兜底，这里再保险一次。
+os.environ.setdefault("TZ", "Asia/Shanghai")
+try:
+    time.tzset()
+except (AttributeError, OSError):
+    pass
 
 
 def __init_logger():
