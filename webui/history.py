@@ -96,6 +96,96 @@ def get_record(record_id: str) -> Optional[dict]:
     return None
 
 
+def update_record(record_id: str, fields: dict) -> bool:
+    """按 id 找到对应行，浅合并 fields 后整行替换。返回是否找到并更新。
+
+    文件采用「读全部 → 改一行 → 写回」的简单实现；MAX_RECORDS=200 的体量
+    下没有性能问题，也不会引入并发写风险（Streamlit 单进程）。
+    """
+    if not record_id or not isinstance(fields, dict):
+        return False
+    if not HISTORY_PATH.is_file():
+        return False
+    try:
+        with HISTORY_PATH.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return False
+
+    updated = False
+    new_lines: list[str] = []
+    for raw in lines:
+        raw_s = raw.strip()
+        if not raw_s:
+            new_lines.append(raw)
+            continue
+        try:
+            rec = json.loads(raw_s)
+        except json.JSONDecodeError:
+            new_lines.append(raw)
+            continue
+        if rec.get("id") == record_id and not updated:
+            rec.update(fields)
+            new_lines.append(json.dumps(rec, ensure_ascii=False) + "\n")
+            updated = True
+        else:
+            new_lines.append(raw)
+
+    if not updated:
+        return False
+
+    tmp_path = HISTORY_PATH.with_suffix(HISTORY_PATH.suffix + ".tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        os.replace(tmp_path, HISTORY_PATH)
+    except OSError:
+        return False
+    return True
+
+
+def delete_record(record_id: str) -> bool:
+    """按 id 找到对应行，删除整行。返回是否找到并删除。"""
+    if not record_id:
+        return False
+    if not HISTORY_PATH.is_file():
+        return False
+    try:
+        with HISTORY_PATH.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return False
+
+    kept: list[str] = []
+    deleted = False
+    for raw in lines:
+        raw_s = raw.strip()
+        if not raw_s:
+            kept.append(raw)
+            continue
+        try:
+            rec = json.loads(raw_s)
+        except json.JSONDecodeError:
+            kept.append(raw)
+            continue
+        if rec.get("id") == record_id and not deleted:
+            deleted = True
+            continue  # 跳过这一行
+        kept.append(raw)
+
+    if not deleted:
+        return False
+
+    tmp_path = HISTORY_PATH.with_suffix(HISTORY_PATH.suffix + ".tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            f.writelines(kept)
+        os.replace(tmp_path, HISTORY_PATH)
+    except OSError:
+        return False
+    return True
+
+
 def clear_all() -> None:
     """清空历史文件。"""
     if HISTORY_PATH.is_file():

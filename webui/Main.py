@@ -99,12 +99,6 @@ if "ui_language" not in st.session_state:
 if "local_video_materials" not in st.session_state:
     # 记住用户最近一次已经落盘的本地素材，避免仅修改文案后二次生成时丢失素材列表。
     st.session_state["local_video_materials"] = []
-if "selected_history_id" not in st.session_state:
-    # 用户在左侧历史列表里点选的记录 id；用于把历史参数回填到主表单。
-    st.session_state["selected_history_id"] = None
-if "history_just_restored" not in st.session_state:
-    # 防止 radio on_change 触发时立刻把 session_state 写回去形成循环。
-    st.session_state["history_just_restored"] = None
 if "custom_scenes" not in st.session_state:
     # 「🎬 场景编排」面板里用户排好的场景列表，每条是一个 dict（含 id/type/参数）
     st.session_state["custom_scenes"] = []
@@ -116,65 +110,37 @@ if "custom_scenes_enabled" not in st.session_state:
 locales = utils.load_locales(i18n_dir)
 
 
-# ── 左侧历史列表 sidebar ──────────────────────────────────────────────
-# 每次执行任务后把 (id, ts, subject, status, videos, params) 追加到
-# storage/task_history.jsonl；点行后通过 selected_history_id 把参数
-# 回填到 session_state，让下方表单 widget 自动显示历史值。
-def _render_history_sidebar() -> None:
-    st.sidebar.markdown("### 📋 历史")
-
-    records = history_store.load_records(limit=30)
-    if st.sidebar.button("🗑️ 清空历史", key="clear_history_btn", use_container_width=True):
-        history_store.clear_all()
-        st.session_state["selected_history_id"] = None
-        st.session_state["history_just_restored"] = None
-        st.rerun()
-
-    if not records:
-        st.sidebar.caption("暂无历史记录。生成一次视频后会自动出现在这里。")
-        return
-
-    def _format(rec):
-        subject = (rec.get("subject") or "(无主题)").strip() or "(无主题)"
-        if len(subject) > 18:
-            subject = subject[:17] + "…"
-        icon = "✅" if rec.get("status") == "success" else "❌"
-        return f"{rec.get('ts', '')} · {subject} · {icon}"
-
-    # 关键：把 list[id] 算好稳定 index，方便 radio 用 index 跟踪。
-    record_ids = [r.get("id") for r in records]
-    current_id = st.session_state.get("selected_history_id")
-    if current_id in record_ids:
-        current_index = record_ids.index(current_id)
-    else:
-        current_index = None
-
-    def _on_select():
-        idx = st.session_state.get("history_radio")
-        if idx is None:
-            st.session_state["selected_history_id"] = None
-            return
-        # index → record id
-        try:
-            st.session_state["selected_history_id"] = record_ids[idx]
-        except (IndexError, TypeError):
-            st.session_state["selected_history_id"] = None
-
-    st.sidebar.radio(
-        "点选一条回填参数",
-        options=list(range(len(records))),
-        index=current_index,
-        format_func=lambda i: _format(records[i]),
-        key="history_radio",
-        on_change=_on_select,
-        label_visibility="collapsed",
-    )
-
-    if st.session_state.get("selected_history_id"):
-        st.sidebar.caption("✅ 已选中 — 主表单已回填下方参数")
+# ── 视图路由（list / detail）────────────────────────────────────────
+# view="list"：列表页，显示所有单据 + 新建/复制/下载/删除入口。
+# view="detail"：详情页，单据的编辑 + 生成视频。
+# current_record_id：详情页正在编辑/查看的记录 id。
+#   - 进入详情页时如果是某个 id：把它的 params 写回 session_state
+#   - 进入详情页时如果为 None：表单从空白开始；点「保存草稿」或
+#     「生成视频」时再 append 一条新记录
+# 一次性：消费 current_record_id，避免 rerun 反复覆盖用户编辑。
+if "view" not in st.session_state:
+    st.session_state["view"] = "list"
+if "current_record_id" not in st.session_state:
+    st.session_state["current_record_id"] = None
+if "pending_record_id" not in st.session_state:
+    # 「点击列表行后跳详情页」时先把 id 暂存在这里，下一次 rerun
+    # 才被详情页消费，避免点击瞬间连续两次 rerun 互相干扰。
+    st.session_state["pending_record_id"] = None
 
 
-_render_history_sidebar()
+def _open_record_detail(record_id):
+    st.session_state["pending_record_id"] = record_id
+    st.session_state["view"] = "detail"
+    st.rerun()
+
+
+def _back_to_list():
+    st.session_state["view"] = "list"
+    st.session_state["current_record_id"] = None
+    st.session_state["pending_record_id"] = None
+    st.rerun()
+
+
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -521,31 +487,9 @@ def _render_scene_io() -> None:
 # ─────────────────────────────────────────────────────────────────────
 
 # 创建一个顶部栏，包含标题和语言选择
-title_col, lang_col = st.columns([3, 1])
+# （顶部栏逻辑移到 _render_top_title()，由列表页/详情页各自调用）
 
-with title_col:
-    st.title(f"MoneyPrinterTurbo v{config.project_version}")
-
-with lang_col:
-    display_languages = []
-    selected_index = 0
-    for i, code in enumerate(locales.keys()):
-        display_languages.append(f"{code} - {locales[code].get('Language')}")
-        if code == st.session_state.get("ui_language", ""):
-            selected_index = i
-
-    selected_language = st.selectbox(
-        "Language / 语言",
-        options=display_languages,
-        index=selected_index,
-        key="top_language_selector",
-        label_visibility="collapsed",
-    )
-    if selected_language:
-        code = selected_language.split(" - ")[0].strip()
-        st.session_state["ui_language"] = code
-        config.ui["language"] = code
-
+# 详情页脚本语言下拉框的可选值（与历史记录里 params.video_language 保持一致）。
 support_locales = [
     "zh-CN",
     "zh-HK",
@@ -558,6 +502,191 @@ support_locales = [
     "th-TH",
     "tr-TR",
 ]
+
+
+# ── 列表页 + 顶部栏 helper ──────────────────────────────────────────
+
+def _render_top_title() -> None:
+    """两个页面都用的顶部栏：项目标题 + 语言下拉。"""
+    title_col, lang_col = st.columns([3, 1])
+    with title_col:
+        st.title(f"MoneyPrinterTurbo v{config.project_version}")
+    with lang_col:
+        display_languages = []
+        selected_index = 0
+        for i, code in enumerate(locales.keys()):
+            display_languages.append(f"{code} - {locales[code].get('Language')}")
+            if code == st.session_state.get("ui_language", ""):
+                selected_index = i
+        selected_language = st.selectbox(
+            "Language / 语言",
+            options=display_languages,
+            index=selected_index,
+            key="top_language_selector",
+            label_visibility="collapsed",
+        )
+        if selected_language:
+            code = selected_language.split(" - ")[0].strip()
+            st.session_state["ui_language"] = code
+            config.ui["language"] = code
+
+
+def _render_list_page() -> None:
+    """列表页：单据卡片列表 + 新建/编辑/复制/下载/删除。
+
+    「新建」和「复制」都立即 append 一条 status="draft" 的记录并跳到
+    详情页（与用户已确认的语义一致）。
+    """
+    _render_top_title()
+    st.markdown("### 📋 历史单据")
+
+    top_cols = st.columns([5, 1])
+    with top_cols[1]:
+        if st.button(
+            "➕ 新建单据",
+            key="list_new",
+            use_container_width=True,
+            type="primary",
+        ):
+            new_id = str(uuid4())
+            history_store.append_record(
+                {
+                    "id": new_id,
+                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "subject": "",
+                    "status": "draft",
+                    "videos": [],
+                    "params": VideoParams(video_subject="").model_dump(mode="json"),
+                }
+            )
+            _open_record_detail(new_id)
+
+    records = history_store.load_records(limit=200)
+    if not records:
+        st.info("还没有任何单据。点「➕ 新建单据」开始。")
+        return
+
+    st.caption(f"共 {len(records)} 条")
+
+    for rec in records:
+        with st.container(border=True):
+            subject = (rec.get("subject") or "(无主题)").strip() or "(无主题)"
+            ts = rec.get("ts", "")
+            status = rec.get("status", "")
+            videos = rec.get("videos") or []
+            params = rec.get("params") or {}
+            script = (
+                (params.get("video_script") or "").strip()
+                if isinstance(params, dict)
+                else ""
+            )
+
+            top = st.columns([5, 2])
+            with top[0]:
+                st.markdown(f"**主题**：{subject}")
+            with top[1]:
+                st.caption(ts)
+
+            if script:
+                preview = script[:160] + ("…" if len(script) > 160 else "")
+                st.markdown(f"**文案**：{preview}")
+
+            status_map = {
+                "success": "✅ 已生成",
+                "failed": "❌ 失败",
+                "draft": "📝 草稿",
+            }
+            st.caption(status_map.get(status, status or "—"))
+
+            actions = st.columns([1, 1, 1.2, 1, 4])
+            with actions[0]:
+                if st.button(
+                    "✏️ 编辑",
+                    key=f"edit_{rec['id']}",
+                    use_container_width=True,
+                ):
+                    _open_record_detail(rec["id"])
+            with actions[1]:
+                if st.button(
+                    "📋 复制",
+                    key=f"copy_{rec['id']}",
+                    use_container_width=True,
+                ):
+                    new_id = str(uuid4())
+                    new_subject = (
+                        f"复制 - {subject}" if subject != "(无主题)" else "复制"
+                    )
+                    history_store.append_record(
+                        {
+                            "id": new_id,
+                            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                            "subject": new_subject,
+                            "status": "draft",
+                            "videos": [],
+                            "params": dict(params) if isinstance(params, dict) else {},
+                        }
+                    )
+                    _open_record_detail(new_id)
+            with actions[2]:
+                # 「下载」：每条单据只暴露第一个视频（通常即主成品 combined-*.mp4），
+                # 避免下载按钮过多；详情页可看更多。
+                if videos:
+                    first = videos[0]
+                    if os.path.isfile(first):
+                        try:
+                            with open(first, "rb") as f:
+                                data = f.read()
+                            st.download_button(
+                                label="⬇️ 下载",
+                                data=data,
+                                file_name=os.path.basename(first),
+                                mime="video/mp4",
+                                key=f"dl_{rec['id']}",
+                                use_container_width=True,
+                            )
+                        except Exception:
+                            st.caption("⚠️ 下载失败")
+                    else:
+                        st.caption("视频已丢失")
+                else:
+                    st.caption("—")
+            with actions[3]:
+                if st.session_state.get(f"confirm_del_{rec['id']}"):
+                    c = st.columns(2)
+                    with c[0]:
+                        if st.button(
+                            "是",
+                            key=f"yes_{rec['id']}",
+                            use_container_width=True,
+                        ):
+                            history_store.delete_record(rec["id"])
+                            st.session_state[f"confirm_del_{rec['id']}"] = False
+                            st.rerun()
+                    with c[1]:
+                        if st.button(
+                            "否",
+                            key=f"no_{rec['id']}",
+                            use_container_width=True,
+                        ):
+                            st.session_state[f"confirm_del_{rec['id']}"] = False
+                            st.rerun()
+                else:
+                    if st.button(
+                        "🗑️",
+                        key=f"del_{rec['id']}",
+                        use_container_width=True,
+                    ):
+                        st.session_state[f"confirm_del_{rec['id']}"] = True
+                        st.rerun()
+
+
+# ── 视图路由 ─────────────────────────────────────────────────────────
+# 列表页用 _render_list_page() 渲染后 st.stop()，避免继续执行下面的
+# 详情页表单代码。详情页保留原 inline 结构（form widgets 用 key= 写
+# session_state，必须在同一 script run 内渲染）。
+if st.session_state["view"] == "list":
+    _render_list_page()
+    st.stop()
 
 
 def get_all_fonts():
@@ -1098,54 +1227,70 @@ if not config.app.get("hide_config", False):
 llm_provider = config.app.get("llm_provider", "").lower()
 
 
-# ── 历史回填 ──────────────────────────────────────────────────────────
-# 当用户在 sidebar 选中一条历史，把 params 全部写回 session_state；
-# 下面 widget 都用 key=，Streamlit 会自动从 session_state 读出最新值。
-if st.session_state.get("selected_history_id"):
-    _rec = history_store.get_record(st.session_state["selected_history_id"])
-    if _rec and isinstance(_rec.get("params"), dict):
-        for _k, _v in _rec["params"].items():
-            # 跳过 None / 复杂对象：widget key 期望的是 scalar 或简单 dict/list
-            if _v is None:
-                continue
+# ── 详情页：当前记录 + 顶部栏 + 历史视频预览 ──────────────────────
+# 「列表页 → 点击行 / 新建 / 复制」会把目标 id 写到 pending_record_id 并
+# 把 view 切到 detail。这里把它消费成 current_record_id（详情页编辑的
+# 目标），同时根据该记录往 session_state 回填表单初始值。整段只在该
+# id 非空时跑一次（rerun 之后 pending_record_id 已经被消费掉）。
+_pending = st.session_state.get("pending_record_id")
+if _pending:
+    st.session_state["current_record_id"] = _pending
+    st.session_state["pending_record_id"] = None
+
+_detail_rec_id = st.session_state.get("current_record_id")
+_detail_rec = (
+    history_store.get_record(_detail_rec_id) if _detail_rec_id else None
+)
+if _detail_rec and isinstance(_detail_rec.get("params"), dict):
+    for _k, _v in _detail_rec["params"].items():
+        # 跳过 None / 复杂对象：widget key 期望的是 scalar 或简单 dict/list
+        if _v is None:
+            continue
+        try:
+            st.session_state[_k] = _v
+        except Exception:
+            pass
+    _vm = _detail_rec["params"].get("video_materials")
+    if isinstance(_vm, list):
+        st.session_state["local_video_materials"] = _vm
+    if _detail_rec["params"].get("custom_audio_file"):
+        st.session_state["custom_audio_file"] = _detail_rec["params"]["custom_audio_file"]
+
+
+# 顶部栏：返回 / 单据标题 / 删除此单据
+_col_back, _col_subject, _col_del = st.columns([1, 4, 1])
+with _col_back:
+    if st.button("← 返回列表", key="detail_back", use_container_width=True):
+        _back_to_list()
+with _col_subject:
+    _subject_display = (
+        (_detail_rec.get("subject") if _detail_rec else "") or "(新建单据)"
+    )
+    st.markdown(f"**{_subject_display}**")
+with _col_del:
+    if _detail_rec and st.button(
+        "🗑️ 删除此单据", key="detail_del", use_container_width=True
+    ):
+        history_store.delete_record(_detail_rec["id"])
+        _back_to_list()
+
+
+# 历史视频预览：单据已有视频时在表单上方展示，避免用户疑惑「为什么表单是空的」
+if _detail_rec and _detail_rec.get("videos"):
+    with st.expander(
+        f"📼 历史视频 — {_detail_rec.get('ts','')} · "
+        f"{_detail_rec.get('subject','(无主题)')}",
+        expanded=False,
+    ):
+        for _url in _detail_rec["videos"][:3]:
             try:
-                st.session_state[_k] = _v
+                if os.path.isfile(_url):
+                    st.video(_url)
+                else:
+                    st.caption(f"⚠️ 视频文件已不在：{_url}")
             except Exception:
                 pass
-        # 恢复 local_videos 路径缓存（与 line 1402 复用逻辑对应）
-        _vm = _rec["params"].get("video_materials")
-        if isinstance(_vm, list):
-            st.session_state["local_video_materials"] = _vm
-        # 恢复 custom_audio_file 路径（widget key 之外，但 form 渲染时 widget 会读）
-        if _rec["params"].get("custom_audio_file"):
-            st.session_state["custom_audio_file"] = _rec["params"]["custom_audio_file"]
-        st.session_state["history_just_restored"] = st.session_state["selected_history_id"]
-    # 一次性：消费掉，避免 rerun 反复覆盖用户当前编辑
-    st.session_state["selected_history_id"] = None
-
-
-# ── 历史视频预览 ──────────────────────────────────────────────────────
-# 回填后顺便在主区域顶部显示历史视频，让用户确认「这是我要的那条」。
-_restored_id = st.session_state.get("history_just_restored")
-if _restored_id:
-    _rec_for_preview = history_store.get_record(_restored_id)
-    if _rec_for_preview and _rec_for_preview.get("videos"):
-        with st.expander(
-            f"📼 历史视频预览 — {_rec_for_preview.get('ts','')} · "
-            f"{_rec_for_preview.get('subject','(无主题)')}",
-            expanded=True,
-        ):
-            for _url in _rec_for_preview["videos"][:3]:
-                try:
-                    if os.path.isfile(_url):
-                        st.video(_url)
-                    else:
-                        st.caption(f"⚠️ 视频文件已不在：{_url}")
-                except Exception:
-                    pass
-            if st.button("关闭预览", key="close_history_preview"):
-                st.session_state["history_just_restored"] = None
-                st.rerun()
+# ─────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -1840,30 +1985,15 @@ with right_panel:
                     config.save_config()
                     st.success(tr("Pixabay API Key deleted successfully"))
 
-start_button = st.button(tr("Generate Video"), use_container_width=True, type="primary")
-if start_button:
-    config.save_config()
-    task_id = str(uuid4())
-    if not params.video_subject and not params.video_script:
-        st.error(tr("Video Script and Subject Cannot Both Be Empty"))
-        scroll_to_bottom()
-        st.stop()
+# ── 提交按钮：💾 保存草稿 / 🎬 生成视频 ─────────────────────────────
+# 两个动作都要把上传的音频/视频落盘 + 渲染场景编辑器 + 写历史；只有
+# 「生成视频」额外跑 tm.start 实际生成视频。共享的「参数持久化」逻辑抽
+# 成 helper，避免两边代码漂移。
+def _persist_uploads_and_scene(params, task_id):
+    """把本会话内的上传文件 / 场景编辑器渲染结果写入磁盘，并改写 params。
 
-    if params.video_source not in ["pexels", "pixabay", "local"]:
-        st.error(tr("Please Select a Valid Video Source"))
-        scroll_to_bottom()
-        st.stop()
-
-    if params.video_source == "pexels" and not config.app.get("pexels_api_keys", ""):
-        st.error(tr("Please Enter the Pexels API Key"))
-        scroll_to_bottom()
-        st.stop()
-
-    if params.video_source == "pixabay" and not config.app.get("pixabay_api_keys", ""):
-        st.error(tr("Please Enter the Pixabay API Key"))
-        scroll_to_bottom()
-        st.stop()
-
+    返回是否有任何持久化错误（True = 有错但不中断；调用方决定是否 st.stop）。
+    """
     if uploaded_audio_file:
         task_dir = utils.task_dir(task_id)
         # 上传文件名来自浏览器，不能直接拼到磁盘路径里；这里只保留扩展名，
@@ -1946,9 +2076,7 @@ if start_button:
                         f"image scene {_sc.get('id')[:8]} missing file, skipped"
                     )
         if not _scene_paths:
-            st.error("场景编排已启用但没有有效的场景，请先添加文字或图片场景")
-            scroll_to_bottom()
-            st.stop()
+            return "scene_empty"
         params.video_source = "local"
         params.video_materials = [
             MaterialInfo(provider="local", url=p) for p in _scene_paths
@@ -1959,6 +2087,90 @@ if start_button:
             f"scene editor: {len(_scene_paths)} materials, "
             f"forced video_source=local, concat=sequential"
         )
+    return None
+
+
+def _write_history_for_current(rec, params, status, videos, task_id):
+    """把 params 写回历史：rec 存在则 update，不存在则 append。"""
+    fields = {
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "subject": (params.video_subject or "").strip(),
+        "status": status,
+        "params": params.model_dump(mode="json"),
+    }
+    # 草稿保留已有 videos（可能是上一轮成功生成留下的），其它状态直接覆盖
+    if status != "draft":
+        fields["videos"] = videos or []
+    try:
+        if rec is not None:
+            history_store.update_record(rec["id"], fields)
+            return rec["id"]
+        else:
+            new_id = task_id
+            history_store.append_record({"id": new_id, **fields})
+            return new_id
+    except Exception as _h_err:
+        logger.warning(f"history write failed: {_h_err}")
+        return None
+
+
+_action_cols = st.columns([1, 1, 4])
+with _action_cols[0]:
+    save_draft_btn = st.button(
+        "💾 保存草稿", use_container_width=True
+    )
+with _action_cols[1]:
+    generate_btn = st.button(
+        tr("Generate Video"),
+        use_container_width=True,
+        type="primary",
+        key="generate_video_btn",
+    )
+
+if save_draft_btn or generate_btn:
+    config.save_config()
+    # 同一记录的多次编辑/生成共用一个 task_id（即记录 id），让 task_dir 可复用。
+    task_id = _detail_rec["id"] if _detail_rec else str(uuid4())
+    _persist_err = _persist_uploads_and_scene(params, task_id)
+    if _persist_err == "scene_empty":
+        st.error("场景编排已启用但没有有效的场景，请先添加文字或图片场景")
+        scroll_to_bottom()
+        st.stop()
+
+    if save_draft_btn:
+        # 草稿允许 subject/script 为空，仅落库，不生成视频。
+        written_id = _write_history_for_current(
+            _detail_rec, params, "draft", None, task_id
+        )
+        if written_id:
+            st.session_state["current_record_id"] = written_id
+            st.session_state["pending_record_id"] = None
+            st.toast("💾 草稿已保存", icon="✅")
+        else:
+            st.error("草稿保存失败，请查看日志")
+        scroll_to_bottom()
+        st.rerun()
+
+    # ── generate 路径：参数校验 + 跑 tm.start + 落历史 ──
+    if not params.video_subject and not params.video_script:
+        st.error(tr("Video Script and Subject Cannot Both Be Empty"))
+        scroll_to_bottom()
+        st.stop()
+
+    if params.video_source not in ["pexels", "pixabay", "local"]:
+        st.error(tr("Please Select a Valid Video Source"))
+        scroll_to_bottom()
+        st.stop()
+
+    if params.video_source == "pexels" and not config.app.get("pexels_api_keys", ""):
+        st.error(tr("Please Enter the Pexels API Key"))
+        scroll_to_bottom()
+        st.stop()
+
+    if params.video_source == "pixabay" and not config.app.get("pixabay_api_keys", ""):
+        st.error(tr("Please Enter the Pixabay API Key"))
+        scroll_to_bottom()
+        st.stop()
 
     log_container = st.empty()
     log_records = []
@@ -1982,19 +2194,7 @@ if start_button:
         st.error(tr("Video Generation Failed"))
         logger.error(tr("Video Generation Failed"))
         # 失败也要落历史（status=failed），方便回看当时参数
-        try:
-            history_store.append_record(
-                {
-                    "id": task_id,
-                    "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "subject": (params.video_subject or "(无主题)").strip() or "(无主题)",
-                    "status": "failed",
-                    "videos": [],
-                    "params": params.model_dump(mode="json"),
-                }
-            )
-        except Exception as _h_err:
-            logger.warning(f"history append failed (error path): {_h_err}")
+        _write_history_for_current(_detail_rec, params, "failed", [], task_id)
         scroll_to_bottom()
         st.stop()
 
@@ -2025,20 +2225,7 @@ if start_button:
         pass
 
     # 写历史（status=success）
-    try:
-        history_store.append_record(
-            {
-                "id": task_id,
-                "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "subject": (params.video_subject or "(无主题)").strip() or "(无主题)",
-                "status": "success",
-                "videos": video_files,
-                "params": params.model_dump(mode="json"),
-            }
-        )
-    except Exception as _h_err:
-        logger.warning(f"history append failed: {_h_err}")
-
+    _write_history_for_current(_detail_rec, params, "success", video_files, task_id)
     open_task_folder(task_id)
     logger.info(tr("Video Generation Completed"))
     scroll_to_bottom()
