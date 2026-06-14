@@ -49,6 +49,7 @@ from scene_store import (
     list_templates, load_template, save_template, delete_template,
     list_drafts, load_draft, save_draft, delete_draft,
 )
+import record_template_store
 
 st.set_page_config(
     page_title="MoneyPrinterTurbo",
@@ -139,6 +140,77 @@ def _back_to_list():
     st.session_state["current_record_id"] = None
     st.session_state["pending_record_id"] = None
     st.rerun()
+
+
+# ── 从模板新建 ────────────────────────────────────────────────────────
+def _apply_record_template(tpl: dict) -> None:
+    """从模板新建一条 status=draft 的单据，params 用模板预设。
+
+    流程与「➕ 新建单据」一致，但用模板的 params 覆盖 VideoParams 默认
+    值；这样详情页 history 恢复时把 params 写回 session_state，widget
+    自动显示模板预设（文案/视频/音频/字幕各项）。
+    """
+    new_id = str(uuid4())
+    tpl_params = tpl.get("params", {}) or {}
+    base = VideoParams(video_subject="").model_dump(mode="json")
+    base.update(tpl_params)
+    # 主题用模板的 video_subject；为空时回退到模板名
+    subject = (tpl_params.get("video_subject") or tpl.get("name", "")).strip() or tpl.get("name", "")
+    history_store.append_record(
+        {
+            "id": new_id,
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "subject": subject,
+            "status": "draft",
+            "videos": [],
+            "params": base,
+        }
+    )
+    # 模板里的场景列表（可选）也种到 session_state，让详情页场景编辑器自动加载
+    if tpl.get("scenes"):
+        # 重新分配 id，避免与用户已有 session_state 撞 widget key
+        for sc in tpl["scenes"]:
+            sc["id"] = str(uuid4())
+        st.session_state["custom_scenes"] = list(tpl["scenes"])
+        st.session_state["custom_scenes_enabled"] = True
+    _open_record_detail(new_id)
+
+
+@st.dialog("📑 从模板新建", width="large")
+def _show_template_picker() -> None:
+    """模板选择器：列出所有模板卡片，点「使用」创建单据并跳详情。"""
+    templates = record_template_store.list_record_templates()
+    if not templates:
+        st.info("还没有任何模板。")
+        if st.button("关闭", key="tpl_picker_close_empty"):
+            st.rerun()
+        return
+
+    st.caption(f"共 {len(templates)} 个模板")
+    for tpl in templates:
+        with st.container(border=True):
+            tpl_id = tpl.get("id", "")
+            tpl_name = tpl.get("name", "(未命名)")
+            tpl_desc = tpl.get("description", "")
+            tpl_source = tpl.get("_source", "user")
+            tpl_params = tpl.get("params", {}) or {}
+
+            col_info, col_action = st.columns([5, 1])
+            with col_info:
+                st.markdown(f"**{tpl_name}**")
+                if tpl_desc:
+                    st.caption(tpl_desc)
+                source_label = "🔒 内置" if tpl_source == "builtin" else "👤 用户"
+                st.caption(f"{source_label} · {len(tpl_params)} 个字段")
+            with col_action:
+                if st.button(
+                    "使用",
+                    key=f"tpl_use_{tpl_id}",
+                    use_container_width=True,
+                    type="primary",
+                ):
+                    _apply_record_template(tpl)
+                    st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -531,6 +603,60 @@ def _render_top_title() -> None:
             config.ui["language"] = code
 
 
+def _render_video_download_button(
+    file_path: str, key: str, use_container_width: bool = True
+) -> None:
+    """统一的视频下载按钮。永远渲染一个有状态的按钮：
+
+    - 有文件 + 可读：active st.download_button，label 带文件名 + 大小
+    - 有路径但文件丢失：disabled 按钮，label "⚠️ 视频文件已丢失"
+    - 路径为空：disabled 按钮，label "📼 尚无视频可下载"
+    - 读取抛错：disabled 按钮，label "⚠️ 下载失败: <err>"
+
+    这样草稿记录也能看到一个「下载」占位，避免用户疑惑「按钮去哪了」。
+    """
+    if not file_path:
+        st.button(
+            "📼 尚无视频可下载",
+            key=key,
+            disabled=True,
+            use_container_width=use_container_width,
+        )
+        return
+    if not os.path.isfile(file_path):
+        st.button(
+            "⚠️ 视频文件已丢失",
+            key=key,
+            disabled=True,
+            use_container_width=use_container_width,
+            help=file_path,
+        )
+        return
+    try:
+        size = os.path.getsize(file_path)
+        if size >= 1024 * 1024:
+            size_label = f"{size / (1024 * 1024):.1f} MB"
+        else:
+            size_label = f"{size / 1024:.0f} KB"
+        with open(file_path, "rb") as f:
+            data = f.read()
+        st.download_button(
+            label=f"⬇️ 下载 {os.path.basename(file_path)} ({size_label})",
+            data=data,
+            file_name=os.path.basename(file_path),
+            mime="video/mp4",
+            key=key,
+            use_container_width=use_container_width,
+        )
+    except Exception as _e:
+        st.button(
+            f"⚠️ 下载失败: {_e}",
+            key=key,
+            disabled=True,
+            use_container_width=use_container_width,
+        )
+
+
 def _render_list_page() -> None:
     """列表页：单据卡片列表 + 新建/编辑/复制/下载/删除。
 
@@ -540,7 +666,7 @@ def _render_list_page() -> None:
     _render_top_title()
     st.markdown("### 📋 历史单据")
 
-    top_cols = st.columns([5, 1])
+    top_cols = st.columns([4, 1, 1.2])
     with top_cols[1]:
         if st.button(
             "➕ 新建单据",
@@ -560,6 +686,14 @@ def _render_list_page() -> None:
                 }
             )
             _open_record_detail(new_id)
+    with top_cols[2]:
+        # 从模板新建走 st.dialog 弹一个模板选择器，不立即创建记录
+        if st.button(
+            "📑 从模板新建",
+            key="list_from_template",
+            use_container_width=True,
+        ):
+            _show_template_picker()
 
     records = history_store.load_records(limit=200)
     if not records:
@@ -598,7 +732,8 @@ def _render_list_page() -> None:
             }
             st.caption(status_map.get(status, status or "—"))
 
-            actions = st.columns([1, 1, 1.2, 1, 4])
+            # 操作行：编辑 / 复制 / 删除
+            actions = st.columns([1, 1, 1, 5])
             with actions[0]:
                 if st.button(
                     "✏️ 编辑",
@@ -627,30 +762,14 @@ def _render_list_page() -> None:
                         }
                     )
                     _open_record_detail(new_id)
+
+            # 全宽下载行：即使草稿也显示按钮（disabled 占位），
+            # 避免用户疑惑「按钮去哪了」。
+            _first_video = videos[0] if videos else ""
+            _render_video_download_button(
+                _first_video, key=f"dl_{rec['id']}"
+            )
             with actions[2]:
-                # 「下载」：每条单据只暴露第一个视频（通常即主成品 combined-*.mp4），
-                # 避免下载按钮过多；详情页可看更多。
-                if videos:
-                    first = videos[0]
-                    if os.path.isfile(first):
-                        try:
-                            with open(first, "rb") as f:
-                                data = f.read()
-                            st.download_button(
-                                label="⬇️ 下载",
-                                data=data,
-                                file_name=os.path.basename(first),
-                                mime="video/mp4",
-                                key=f"dl_{rec['id']}",
-                                use_container_width=True,
-                            )
-                        except Exception:
-                            st.caption("⚠️ 下载失败")
-                    else:
-                        st.caption("视频已丢失")
-                else:
-                    st.caption("—")
-            with actions[3]:
                 if st.session_state.get(f"confirm_del_{rec['id']}"):
                     c = st.columns(2)
                     with c[0]:
@@ -659,9 +778,20 @@ def _render_list_page() -> None:
                             key=f"yes_{rec['id']}",
                             use_container_width=True,
                         ):
-                            history_store.delete_record(rec["id"])
-                            st.session_state[f"confirm_del_{rec['id']}"] = False
-                            st.rerun()
+                            try:
+                                history_store.delete_record(rec["id"])
+                            except OSError as _e:
+                                st.error(
+                                    f"删除失败：{_e}。通常是 "
+                                    "storage/task_history.jsonl 或所在目录"
+                                    "没有写权限，请在容器里 `chown -R` 或"
+                                    " `chmod` 后再试。"
+                                )
+                            else:
+                                st.session_state[
+                                    f"confirm_del_{rec['id']}"
+                                ] = False
+                                st.rerun()
                     with c[1]:
                         if st.button(
                             "否",
@@ -1271,8 +1401,17 @@ with _col_del:
     if _detail_rec and st.button(
         "🗑️ 删除此单据", key="detail_del", use_container_width=True
     ):
-        history_store.delete_record(_detail_rec["id"])
-        _back_to_list()
+        try:
+            history_store.delete_record(_detail_rec["id"])
+        except OSError as _e:
+            st.error(
+                f"删除失败：{_e}。通常是 "
+                "storage/task_history.jsonl 或所在目录"
+                "没有写权限，请在容器里 `chown -R` 或"
+                " `chmod` 后再试。"
+            )
+        else:
+            _back_to_list()
 
 
 # 历史视频预览：单据已有视频时在表单上方展示，避免用户疑惑「为什么表单是空的」

@@ -7,6 +7,8 @@
 
 import json
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -96,6 +98,53 @@ def get_record(record_id: str) -> Optional[dict]:
     return None
 
 
+def _write_jsonl_atomic(path: Path, lines: List[str]) -> None:
+    """把 lines 原子写回 path。三种策略按权限梯度尝试：
+
+    1. 直接 in-place rewrite：只要求对文件本身有写权限（root / 666 都行）。
+    2. .tmp + os.replace：要求对文件所在目录有写权限。
+    3. 把 .tmp 放到 tempfile.gettempdir()/history_jsonl_*.tmp，再 copyfile +
+       unlink 覆盖目标：在 storage/ 是 root:root、当前进程是 magiccops
+       这种「目录不可写、文件也不可写」的退化场景下也撑得住。
+    全部失败时把最后的 OSError 原样抛出去，让上层 toast 给用户看。
+    """
+    content = "".join(lines)
+
+    # 策略 1：in-place rewrite
+    try:
+        with path.open("w", encoding="utf-8") as f:
+            f.write(content)
+        return
+    except OSError:
+        pass
+
+    # 策略 2：同目录 .tmp + os.replace
+    tmp_in_dir = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with tmp_in_dir.open("w", encoding="utf-8") as f:
+            f.write(content)
+        os.replace(tmp_in_dir, path)
+        return
+    except OSError:
+        if tmp_in_dir.exists():
+            try:
+                tmp_in_dir.unlink()
+            except OSError:
+                pass
+
+    # 策略 3：tmp 目录可写时绕开 storage/ 目录权限
+    fd, tmp_path = tempfile.mkstemp(prefix="history_jsonl_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        shutil.copyfile(tmp_path, path)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def update_record(record_id: str, fields: dict) -> bool:
     """按 id 找到对应行，浅合并 fields 后整行替换。返回是否找到并更新。
 
@@ -134,18 +183,15 @@ def update_record(record_id: str, fields: dict) -> bool:
     if not updated:
         return False
 
-    tmp_path = HISTORY_PATH.with_suffix(HISTORY_PATH.suffix + ".tmp")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as f:
-            f.writelines(new_lines)
-        os.replace(tmp_path, HISTORY_PATH)
-    except OSError:
-        return False
+    _write_jsonl_atomic(HISTORY_PATH, new_lines)
     return True
 
 
 def delete_record(record_id: str) -> bool:
-    """按 id 找到对应行，删除整行。返回是否找到并删除。"""
+    """按 id 找到对应行，删除整行。返回是否找到并删除。
+
+    抛 OSError：写盘失败时不再静默吞掉，让调用方 toast 给用户看。
+    """
     if not record_id:
         return False
     if not HISTORY_PATH.is_file():
@@ -176,13 +222,7 @@ def delete_record(record_id: str) -> bool:
     if not deleted:
         return False
 
-    tmp_path = HISTORY_PATH.with_suffix(HISTORY_PATH.suffix + ".tmp")
-    try:
-        with tmp_path.open("w", encoding="utf-8") as f:
-            f.writelines(kept)
-        os.replace(tmp_path, HISTORY_PATH)
-    except OSError:
-        return False
+    _write_jsonl_atomic(HISTORY_PATH, kept)
     return True
 
 
