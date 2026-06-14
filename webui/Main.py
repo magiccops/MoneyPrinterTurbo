@@ -213,6 +213,28 @@ def _show_template_picker() -> None:
                     st.rerun()
 
 
+@st.dialog("📋 任务日志", width="large")
+def _show_task_log(record_id: str) -> None:
+    """在弹窗中显示 record_id 对应任务的运行日志。"""
+    # 日志文件位于 storage/tasks/<record_id>/task.log
+    log_path = os.path.join(
+        root_dir, "storage", "tasks", record_id, "task.log"
+    )
+    if not os.path.isfile(log_path):
+        st.info("暂无日志。视频生成过程中会自动记录。")
+        return
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        st.error("无法读取日志文件。")
+        return
+    if not content.strip():
+        st.info("日志为空。")
+        return
+    st.code(content, language=None)
+
+
 # ─────────────────────────────────────────────────────────────────────
 
 
@@ -732,8 +754,8 @@ def _render_list_page() -> None:
             }
             st.caption(status_map.get(status, status or "—"))
 
-            # 操作行：编辑 / 复制 / 删除
-            actions = st.columns([1, 1, 1, 5])
+            # 操作行：编辑 / 复制 / 日志 / 删除
+            actions = st.columns([1, 1, 1, 1, 4])
             with actions[0]:
                 if st.button(
                     "✏️ 编辑",
@@ -762,6 +784,13 @@ def _render_list_page() -> None:
                         }
                     )
                     _open_record_detail(new_id)
+            with actions[2]:
+                if st.button(
+                    "📋 日志",
+                    key=f"log_{rec['id']}",
+                    use_container_width=True,
+                ):
+                    _show_task_log(rec["id"])
 
             # 全宽下载行：即使草稿也显示按钮（disabled 占位），
             # 避免用户疑惑「按钮去哪了」。
@@ -769,7 +798,7 @@ def _render_list_page() -> None:
             _render_video_download_button(
                 _first_video, key=f"dl_{rec['id']}"
             )
-            with actions[2]:
+            with actions[3]:
                 if st.session_state.get(f"confirm_del_{rec['id']}"):
                     c = st.columns(2)
                     with c[0]:
@@ -2322,6 +2351,23 @@ if save_draft_btn or generate_btn:
             st.code("\n".join(log_records))
 
     logger.add(log_received)
+    # 把日志同步写到 task_dir/task.log，列表页「📋 日志」按钮可回看
+    _log_dir = utils.task_dir(task_id)
+    _log_path = os.path.join(_log_dir, "task.log")
+    try:
+        _log_fh = open(_log_path, "a", encoding="utf-8")
+    except OSError:
+        _log_fh = None
+
+    def _log_to_disk(msg):
+        if _log_fh:
+            try:
+                _log_fh.write(msg + "\n")
+                _log_fh.flush()
+            except OSError:
+                pass
+
+    logger.add(_log_to_disk, level="DEBUG")
 
     st.toast(tr("Generating Video"))
     logger.info(tr("Start Generating Video"))
@@ -2329,6 +2375,12 @@ if save_draft_btn or generate_btn:
     scroll_to_bottom()
 
     result = tm.start(task_id=task_id, params=params)
+    # 关闭日志文件句柄
+    if _log_fh:
+        try:
+            _log_fh.close()
+        except OSError:
+            pass
     if not result or "videos" not in result:
         st.error(tr("Video Generation Failed"))
         logger.error(tr("Video Generation Failed"))
