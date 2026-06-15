@@ -2,7 +2,8 @@ import math
 import os.path
 import re
 import subprocess
-from datetime import timedelta
+import sys
+from datetime import datetime, timedelta
 from os import path
 
 import edge_tts
@@ -15,6 +16,47 @@ from app.models.schema import VideoConcatMode, VideoParams
 from app.services import llm, material, subtitle, video, voice, upload_post
 from app.services import state as sm
 from app.utils import utils
+
+# 「💾 history 兜底写入」：webui/Main.py 在 tm.start 返回后会用
+# _write_history_for_current 写 status=success / failed + videos。
+# 但 tm.start 是同步阻塞调用，期间任何 streamlit 异常 / 用户断网 /
+# scriptrun abort 都会让 main.py 后续 _write_history_for_current 跑不到，
+# 磁盘上视频已经生成但 history record 还是 draft + videos=[]（用户体感
+# "视频没生成"）。这里在 task.py 内部 return kwargs 之前再写一次 history：
+# - webui 进程：root_dir 已在 sys.path，import 成功
+# - 纯 api / FastAPI 进程：import 失败时降级（不阻断任务），下次重试就行
+_THIS_DIR = os.path.dirname(os.path.realpath(__file__))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.append(_PROJECT_ROOT)
+try:
+    from webui import history as _history_store
+except ImportError:
+    _history_store = None
+
+
+def _persist_history_record(task_id, params, status, videos):
+    """task.py 内部兜底写 history record。失败也不抛（不阻断任务）。"""
+    if _history_store is None:
+        return False
+    try:
+        fields = {
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "subject": (params.video_subject or "").strip(),
+            "status": status,
+            "params": params.model_dump(mode="json"),
+            "videos": list(videos or []),
+        }
+        # append_record 在 record 不存在时新建；存在时 update_record。
+        # 这里两条都试一次：先查再 append/update，保证幂等。
+        existing = _history_store.get_record(task_id)
+        if existing is not None:
+            return _history_store.update_record(task_id, fields)
+        _history_store.append_record({"id": task_id, **fields})
+        return True
+    except Exception as _e:
+        logger.warning(f"history 兜底写失败（不影响任务）: {_e}")
+        return False
 
 
 def generate_script(task_id, params):
@@ -553,6 +595,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
 
     if not final_video_paths:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        _persist_history_record(task_id, params, "failed", [])
         return
 
     logger.success(
@@ -588,6 +631,10 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     sm.state.update_task(
         task_id, state=const.TASK_STATE_COMPLETE, progress=100, **kwargs
     )
+    # 兜底：把 success 状态 + 视频路径写进 history，main.py 那边的
+    # _write_history_for_current 是次要路径。即便 webui 同步阻塞 + scriptrun
+    # abort 让 main.py 后续跑不到，磁盘上 history 也能反映真实结果。
+    _persist_history_record(task_id, params, "success", final_video_paths)
     return kwargs
 
 
