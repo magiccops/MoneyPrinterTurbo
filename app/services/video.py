@@ -46,6 +46,7 @@ class SubClippedVideoClip:
         height=None,
         duration=None,
         source_file_path=None,
+        max_duration=None,
     ):
         self.file_path = file_path
         self.start_time = start_time
@@ -57,9 +58,13 @@ class SubClippedVideoClip:
             self.duration = end_time - start_time
         else:
             self.duration = duration
+        # 该 subclip 期望的最长停留时长（per-scene duration）。
+        # 第二次外层循环里用这个替代全局 max_clip_duration 做截断，
+        # 避免用户单段 duration > max_clip_duration 时被全局阈值砍掉。
+        self.max_duration = max_duration
 
     def __str__(self):
-        return f"SubClippedVideoClip(file_path={self.file_path}, start_time={self.start_time}, end_time={self.end_time}, duration={self.duration}, width={self.width}, height={self.height})"
+        return f"SubClippedVideoClip(file_path={self.file_path}, start_time={self.start_time}, end_time={self.end_time}, duration={self.duration}, max_duration={self.max_duration}, width={self.width}, height={self.height})"
 
 
 audio_codec = "aac"
@@ -505,6 +510,7 @@ def combine_videos(
     video_concat_mode: VideoConcatMode = VideoConcatMode.random,
     video_transition_mode: VideoTransitionMode = None,
     max_clip_duration: int = 5,
+    max_clip_durations: List[float] | None = None,
     threads: int = 2,
 ) -> str:
     audio_clip = AudioFileClip(audio_file)
@@ -516,6 +522,10 @@ def combine_videos(
         close_clip(audio_clip)
     logger.info(f"audio duration: {audio_duration} seconds")
     logger.info(f"maximum clip duration: {max_clip_duration} seconds")
+    if max_clip_durations:
+        logger.info(
+            f"per-scene max durations: {max_clip_durations}"
+        )
 
     # 兼容 API 直接调用时未传转场模式的情况，避免后续访问 .value 时崩溃。
     transition_value = getattr(video_transition_mode, "value", video_transition_mode)
@@ -527,16 +537,21 @@ def combine_videos(
     processed_clips = []
     subclipped_items = []
     video_duration = 0
-    for video_path in video_paths:
+    for vi, video_path in enumerate(video_paths):
         clip = _open_video_clip_quietly(video_path)
         clip_duration = clip.duration
         clip_w, clip_h = clip.size
         close_clip(clip)
-        
+
         start_time = 0
+        # 每张 scene 的实际最大停留时长：优先取 max_clip_durations[vi]，
+        # 缺省时回退到全局 max_clip_duration。
+        this_max = max_clip_duration
+        if max_clip_durations is not None and vi < len(max_clip_durations) and max_clip_durations[vi]:
+            this_max = float(max_clip_durations[vi])
 
         while start_time < clip_duration:
-            end_time = min(start_time + max_clip_duration, clip_duration)
+            end_time = min(start_time + this_max, clip_duration)
 
             # 保留所有有效分段。
             # 这样既不会丢掉“整段视频本身就短于 max_clip_duration”的素材，
@@ -550,6 +565,7 @@ def combine_videos(
                         width=clip_w,
                         height=clip_h,
                         source_file_path=video_path,
+                        max_duration=this_max,
                     )
                 )
 
@@ -624,8 +640,11 @@ def combine_videos(
                 shuffle_transition = random.choice(transition_funcs)
                 clip = shuffle_transition(clip)
 
-            if clip.duration > max_clip_duration:
-                clip = clip.subclipped(0, max_clip_duration)
+            # 截断用 per-scene max（用户为该 scene 单配的时长），缺省回退全局阈值。
+            # 这样 per-scene duration > max_clip_duration 时不会被全局值砍掉。
+            _this_max = getattr(subclipped_item, "max_duration", None) or max_clip_duration
+            if clip.duration > _this_max:
+                clip = clip.subclipped(0, _this_max)
                 
             # wirte clip to temp file
             clip_file = f"{output_dir}/temp-clip-{i+1}.mp4"
@@ -1082,7 +1101,11 @@ def generate_video(
     del video_clip
 
 
-def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
+def preprocess_video(
+    materials: List[MaterialInfo],
+    clip_duration=4,
+    durations: List[float] | None = None,
+):
     # WebUI 在某些二次生成场景下可能传入空素材列表，这里直接返回空结果，避免抛出 NoneType 异常。
     if not materials:
         return []
@@ -1091,7 +1114,7 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
     valid_materials = []
     local_videos_dir = utils.storage_dir("local_videos", create=True)
 
-    for material in materials:
+    for idx, material in enumerate(materials):
         if not material.url:
             continue
 
@@ -1142,19 +1165,26 @@ def preprocess_video(materials: List[MaterialInfo], clip_duration=4):
                 logger.info(f"processing image: {material_source_path}")
                 # 探测尺寸时已经打开过一次素材，这里先释放探测句柄，再重新创建用于导出的图片 clip。
                 close_clip(clip)
-                # Create an image clip and set its duration to 3 seconds
+                # 每张场景的停留时长优先取 durations[idx]（场景编排路径下由
+                # 每张 scene 单独配置），未配置时回退到全局 clip_duration。
+                # 这样能让 N 段加总 ≈ 音频总长，避免「N×clip 与 audio 错位 +
+                # combine_videos 循环追加」造成的"语音已读到 3、画面还在 2"。
+                this_duration = clip_duration
+                if durations is not None and idx < len(durations) and durations[idx]:
+                    this_duration = float(durations[idx])
+                # Create an image clip and set its duration to this_duration seconds
                 clip = (
                     ImageClip(material_source_path)
-                    .with_duration(clip_duration)
+                    .with_duration(this_duration)
                     .with_position("center")
                 )
                 # Apply a zoom effect using the resize method.
                 # A lambda function is used to make the zoom effect dynamic over time.
                 # The zoom effect starts from the original size and gradually scales up to 120%.
-                # t represents the current time, and clip.duration is the total duration of the clip (3 seconds).
+                # t represents the current time, and clip.duration is the total duration of the clip.
                 # Note: 1 represents 100% size, so 1.2 represents 120% size.
                 zoom_clip = clip.resized(
-                    lambda t: 1 + (clip_duration * 0.03) * (t / clip.duration)
+                    lambda t: 1 + (this_duration * 0.03) * (t / clip.duration)
                 )
 
                 # Optionally, create a composite video clip containing the zoomed clip.

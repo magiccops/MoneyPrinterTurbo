@@ -250,10 +250,12 @@ SCENE_DEFAULT_TEXT = {
     "accent_color": "#FF6B6B",
     "title_size": 140,
     "body_size": 72,
+    "duration": 3.0,
 }
 SCENE_DEFAULT_IMAGE = {
     "file_path": "",
     "original_name": "",
+    "duration": 3.0,
 }
 LOCAL_VIDEOS_DIR_FOR_SCENES = os.path.join(root_dir, "storage", "local_videos")
 
@@ -349,6 +351,24 @@ def _render_scene_card(scene: dict, idx: int, total: int) -> None:
             for k, v in (SCENE_DEFAULT_TEXT if new_type == "text" else SCENE_DEFAULT_IMAGE).items():
                 scene.setdefault(k, v)
             st.rerun()
+
+        # 每张 scene 单独配置停留时长（秒），提交时由 preprocess_video /
+        # combine_videos 按 scene 单独处理，让 N 段加总 ≈ 音频总长，
+        # 避免「N×clip_duration < audio_duration」触发 combine_videos 循环追加，
+        # 造成"语音已读到下一段、画面还停在当前段"的错位。
+        try:
+            _cur_dur = float(scene.get("duration", 3.0))
+        except (TypeError, ValueError):
+            _cur_dur = 3.0
+        scene["duration"] = st.slider(
+            "⏱ 时长（秒）",
+            min_value=1.0,
+            max_value=15.0,
+            value=_cur_dur,
+            step=0.5,
+            key=f"scene_{scene['id']}_duration",
+            help="该场景在视频里停留多久。配合顶部「🎯 按总时长均分」能让 N 段加总 ≈ 音频总长，避免画面与语音错位。",
+        )
 
         # 字段编辑
         if scene["type"] == "text":
@@ -448,6 +468,32 @@ def _render_scene_editor() -> None:
             st.caption("👇 点下方按钮添加第一张场景，或点上面「📚 模板 / 草稿」加载现成的。")
         else:
             st.caption("💡 调整字段时缩略图会自动重渲；提交时会用 1080×1920 全尺寸重渲一次。")
+
+            # 「🎯 按总时长均分」：用户填预计音频总秒数（如 24），点按钮把 N 段
+            # duration 都设成 总时长/N，提交时 N 段加总 ≈ 音频总长 → 画面与
+            # 语音节奏对齐，不再触发 combine_videos 循环追加。
+            with st.container(border=True):
+                st.markdown("**🎯 按总时长均分**")
+                st.caption("填预计音频总秒数（=TTS 读完整段文案时长），点按钮把 N 段时长均分。")
+                _total = st.number_input(
+                    "总时长（秒）",
+                    min_value=float(n),
+                    max_value=600.0,
+                    value=float(n) * 3.0,
+                    step=1.0,
+                    key="scene_io_total_duration",
+                )
+                if st.button(
+                    f"📐 均分给 {n} 段（每段 {_total / n:.2f}s）",
+                    key="scene_io_distribute_durations",
+                    use_container_width=True,
+                ):
+                    _per = round(float(_total) / n, 2)
+                    for _sc in scenes:
+                        _sc["duration"] = _per
+                    st.toast(f"已均分：{n} 段 × {_per}s = {_per * n:.2f}s")
+                    st.rerun()
+
             for i, sc in enumerate(list(scenes)):  # list() 防止中途修改
                 _render_scene_card(sc, i, n)
 
@@ -2271,9 +2317,20 @@ def _persist_uploads_and_scene(params, task_id):
         if not _scene_paths:
             return "scene_empty"
         params.video_source = "local"
-        params.video_materials = [
-            MaterialInfo(provider="local", url=p) for p in _scene_paths
-        ]
+        # 把每张 scene 的 duration 一并写入 MaterialInfo.duration；
+        # task.py / video.py 会用它替代全局 video_clip_duration 来决定
+        # 该 scene 实际停留时长（避免 N×clip 与 audio 错位）。
+        # 没填 duration 的旧 scene 写成 0，由 video.py 端回退到全局值。
+        params.video_materials = []
+        for _sc, _path in zip(st.session_state["custom_scenes"], _scene_paths):
+            _dur = _sc.get("duration")
+            try:
+                _dur_int = max(0, int(round(float(_dur)))) if _dur else 0
+            except (TypeError, ValueError):
+                _dur_int = 0
+            params.video_materials.append(
+                MaterialInfo(provider="local", url=_path, duration=_dur_int)
+            )
         # 保持用户排的顺序；金句卡与图的关系不能被打乱
         params.video_concat_mode = VideoConcatMode.sequential.value
         logger.info(

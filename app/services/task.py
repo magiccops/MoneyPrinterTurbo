@@ -166,8 +166,18 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
 def get_video_materials(task_id, params, video_terms, audio_duration):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
+        # 场景编排路径下，每张 scene 携带自己的 duration（来自场景卡片 UI）；
+        # 把它们提取出来传给 preprocess_video，让 N 段加总 ≈ 音频总长，
+        # 避免「N×clip_duration < audio_duration」触发 combine_videos 循环追加，
+        # 造成"语音已读到下一段、画面还停在当前段"的错位。
+        # duration=0 的项（如历史 Pexels/Pixabay 路径）回退到全局 clip_duration。
+        per_scene_durations = [
+            float(m.duration) for m in params.video_materials if getattr(m, "duration", 0)
+        ]
         materials = video.preprocess_video(
-            materials=params.video_materials, clip_duration=params.video_clip_duration
+            materials=params.video_materials,
+            clip_duration=params.video_clip_duration,
+            durations=per_scene_durations or None,
         )
         if not materials:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
@@ -175,7 +185,10 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                 "no valid materials found, please check the materials and try again."
             )
             return None
-        return [material_info.url for material_info in materials]
+        return (
+            [material_info.url for material_info in materials],
+            per_scene_durations or None,
+        )
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
         downloaded_videos = material.download_videos(
@@ -193,11 +206,11 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                 "failed to download videos, maybe the network is not available. if you are in China, please use a VPN."
             )
             return None
-        return downloaded_videos
+        return downloaded_videos, None
 
 
 def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path
+    task_id, params, downloaded_videos, audio_file, subtitle_path, scene_durations=None
 ):
     final_video_paths = []
     combined_video_paths = []
@@ -221,6 +234,7 @@ def generate_final_videos(
             video_concat_mode=video_concat_mode,
             video_transition_mode=video_transition_mode,
             max_clip_duration=params.video_clip_duration,
+            max_clip_durations=scene_durations,
             threads=params.n_threads,
         )
 
@@ -348,7 +362,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
-    downloaded_videos = get_video_materials(
+    downloaded_videos, scene_durations = get_video_materials(
         task_id, params, video_terms, audio_duration
     )
     if not downloaded_videos:
@@ -373,7 +387,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
 
     # 6. Generate final videos
     final_video_paths, combined_video_paths = generate_final_videos(
-        task_id, params, downloaded_videos, audio_file, subtitle_path
+        task_id, params, downloaded_videos, audio_file, subtitle_path, scene_durations
     )
 
     if not final_video_paths:
