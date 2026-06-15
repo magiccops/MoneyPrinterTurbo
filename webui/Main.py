@@ -1415,6 +1415,31 @@ if _detail_rec and isinstance(_detail_rec.get("params"), dict):
     if _detail_rec["params"].get("custom_audio_file"):
         st.session_state["custom_audio_file"] = _detail_rec["params"]["custom_audio_file"]
 
+# 「🎬 场景编排」恢复：VideoParams 模型不含 custom_scenes，上面通用循环
+# 虽会写回 list/bool，但必须重新分配 scene id（场景卡 widget key 形如
+# scene_<id>_title，复用旧 id 会命中之前编辑留下的 widget state 残留值）。
+# 用 scenes_restored_for 守卫保证每个 record id 只恢复一次，避免每次
+# rerun 都重新分配 id 把当前编辑的 widget state 弄乱。
+# ⚠️ 仅当 record 实际存过 scenes（list 类型，无论空非空）才覆盖
+# session_state；否则保留「从模板新建」等流程预先塞好的 scenes（此时
+# record 还没保存过草稿，params 里没 custom_scenes 字段）。
+if _detail_rec:
+    _rec_id = _detail_rec.get("id")
+    if st.session_state.get("scenes_restored_for") != _rec_id:
+        _rec_scenes = _detail_rec.get("params", {}).get("custom_scenes")
+        if isinstance(_rec_scenes, list):
+            if _rec_scenes:
+                for _sc in _rec_scenes:
+                    if isinstance(_sc, dict) and _sc.get("id"):
+                        _sc["id"] = str(uuid4())
+            st.session_state["custom_scenes"] = list(_rec_scenes)
+            st.session_state["custom_scenes_enabled"] = bool(
+                _detail_rec.get("params", {}).get(
+                    "custom_scenes_enabled", False
+                )
+            )
+        st.session_state["scenes_restored_for"] = _rec_id
+
 
 # 顶部栏：返回 / 单据标题 / 删除此单据
 _col_back, _col_subject, _col_del = st.columns([1, 4, 1])
@@ -2266,6 +2291,14 @@ def _write_history_for_current(rec, params, status, videos, task_id):
         "status": status,
         "params": params.model_dump(mode="json"),
     }
+    # 「🎬 场景编排」不在 VideoParams 模型里，单独塞到 params dict 里保存；
+    # 这样编辑详情页时由下面的恢复逻辑自动写回 session_state["custom_scenes"]。
+    # 不存 = 永远拿不回场景（用户体感："编辑时场景编排没带出来"）。
+    _scenes = st.session_state.get("custom_scenes") or []
+    fields["params"]["custom_scenes"] = list(_scenes)  # 拷贝防止下游误改原 list
+    fields["params"]["custom_scenes_enabled"] = bool(
+        st.session_state.get("custom_scenes_enabled")
+    )
     # 草稿保留已有 videos（可能是上一轮成功生成留下的），其它状态直接覆盖
     if status != "draft":
         fields["videos"] = videos or []
