@@ -2481,9 +2481,11 @@ if save_draft_btn or generate_btn:
     logger.add(_log_to_disk, level="DEBUG")
 
     # 「按 1./2./3. 切分」+「场景编排」两个开关都打开时，把两个会话级
-    # 字段（不在 VideoParams 模型里）也透传到 params，让 task.py 内的
-    # getattr 探测能拿到正确值。custom_scenes 在 _persist_uploads_and_scene
-    # 里以 video_materials 形式带过去了；这里补 auto_split_by_markers。
+    # 字段也透传到 params，让 task.py 内的 getattr 探测能拿到正确值：
+    #   - auto_split_by_markers：是否启用按 1./2./3. 自动切分
+    #   - custom_scenes：完整的 scene 列表（带 type/duration 等），task.py
+    #     据此判断"切出的段数 == scene 数"才触发分段 TTS（之前漏传
+    #     custom_scenes 导致 auto_split_by_markers 永远 fallback 整段 TTS）
     setattr(
         params,
         "auto_split_by_markers",
@@ -2491,6 +2493,11 @@ if save_draft_btn or generate_btn:
             st.session_state.get("auto_split_by_markers")
             and st.session_state.get("custom_scenes_enabled")
         ),
+    )
+    setattr(
+        params,
+        "custom_scenes",
+        list(st.session_state.get("custom_scenes") or []),
     )
 
     st.toast(tr("Generating Video"))

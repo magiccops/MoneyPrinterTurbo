@@ -113,6 +113,13 @@ class VideoParams(BaseModel):
     # 据此把整段 TTS 拆成 N 段独立生成、测每段时长注入到 scene.duration。
     # 关闭时（默认）走整段 TTS 路径，行为与历史完全一致。
     auto_split_by_markers: bool = False
+    # 「🎬 场景编排」的完整 scene 列表（每张含 type/title/duration 等）。
+    # VideoParams 模型本身不含业务数据，但 task.py 的 auto_split 判断需要
+    # 知道「切出的段数 == scene 数」才能触发分段 TTS——主流程必须把
+    # st.session_state["custom_scenes"] 透传过来（webui/Main.py 提交流
+    # setattr）。不在 model_dump() 里序列化（exclude=True），避免污染
+    # JSONL 历史字段；只在内存中传参用。
+    custom_scenes: Optional[list] = Field(default=None, exclude=True)
 
 
 class SubtitleRequest(BaseModel):
