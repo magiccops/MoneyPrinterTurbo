@@ -243,6 +243,55 @@ def split_string_by_punctuations(s):
     return result
 
 
+# 「按数字标记切分文案」：识别脚本里的 `1.` / `2、` / `3)` / `4）` 段起始标记，
+# 用于「🎬 场景编排」与旁白自动对齐：用户在主表单 video_script 里写 N 段
+# 并在每段开头标注序号，task.py 据此把整段 TTS 拆成 N 段独立生成、按段测时长，
+# 注入到每张 scene 的 duration，避免「N×clip_duration < audio_duration」时
+# combine_videos 循环追加造成的"语音已读到下一段、画面还停在当前段"错位。
+#
+# 标记语法：
+#   - 数字 N（1..99）
+#   - 后接分隔符：「.  / 「、」 / 「)」 / 「）」
+#   - 分隔符后接空白或行尾（避免误把 "1.5%" 里的 "1." 识别为标记）
+#   - N 必须从 1 开始严格连续升序（1, 2, 3, ...），缺号 / 乱序不算"按标记切分"
+import re as _re_for_marker_split
+
+_SCRIPT_MARKER_RE = _re_for_marker_split.compile(
+    r"(?<!\d)(\d{1,2})[、.)）](?!\d)"
+)
+
+
+def split_script_by_markers(script: str):
+    """
+    按 `1.` / `2、` / `3)` / `4）` 标记把脚本切成 N 段。
+
+    Returns:
+        - list[str] 长度 >= 2：成功切分
+        - None：未识别到有效标记（不强制按标记切分，由调用方决定 fallback）
+    """
+    if not script:
+        return None
+    matches = list(_SCRIPT_MARKER_RE.finditer(script))
+    if len(matches) < 2:
+        return None
+    # 严格 1..N 升序
+    nums = [int(m.group(1)) for m in matches]
+    if nums != list(range(1, len(nums) + 1)):
+        return None
+    # 切分：每段起点 = 当前 marker 之后（m.end()），
+    # 终点 = 下一个 marker 起始处（m.start()）或 script 末尾。
+    # 注意：end 不能用 m.end()（否则会漏进下一个 marker 自身）。
+    starts = [m.end() for m in matches]
+    ends = [m.start() for m in matches[1:]] + [len(script)]
+    segments = []
+    for s, e in zip(starts, ends):
+        seg = script[s:e].strip()
+        if not seg:
+            return None  # 存在空段（连续标记）→ 视为无效
+        segments.append(seg)
+    return segments
+
+
 def normalize_script_for_subtitle_matching(video_script: str) -> str:
     """
     清理字幕匹配前的脚本文本。

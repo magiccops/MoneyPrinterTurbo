@@ -460,6 +460,21 @@ def _render_scene_editor() -> None:
             help="启用后，提交时会把下面这些场景渲染/拼成 video_materials，强制走 local 视频源。",
         )
 
+        # 「按 1./2./3. 标记自动切分」：在主表单 video_script 里按段写
+        # `1. xxx 2. xxx 3. xxx` 等数字标记，提交时 task.py 会按标记切分成
+        # N 段独立 TTS、自动测每段时长注入到每张 scene 的 duration，
+        # 让「语音读到 N 段」与「画面切到第 N 张」严格对齐。
+        # 切分结果不合法（< 2 段、段数 != scene 数、乱序/跳号）会 fallback
+        # 到整段 TTS，不影响出片。
+        st.checkbox(
+            "🔢 按 1./2./3. 标记自动切分（与视频切换同步）",
+            key="auto_split_by_markers",
+            help="在主表单 Video Script 里按 N 段写 `1. xxx 2. xxx 3. xxx ...` 标记。"
+            "提交时按标记切分 TTS，每段自动测时长，注入到对应 scene.duration。"
+            "切分无效时自动回退到整段 TTS，不影响出片。",
+            disabled=not st.session_state.get("custom_scenes_enabled", False),
+        )
+
         # ── 模板 / 草稿 I/O 子面板（默认折叠，干净） ──────────────
         with st.expander("📚 模板 / 草稿", expanded=False):
             _render_scene_io()
@@ -2351,6 +2366,8 @@ def _write_history_for_current(rec, params, status, videos, task_id):
     # 「🎬 场景编排」不在 VideoParams 模型里，单独塞到 params dict 里保存；
     # 这样编辑详情页时由下面的恢复逻辑自动写回 session_state["custom_scenes"]。
     # 不存 = 永远拿不回场景（用户体感："编辑时场景编排没带出来"）。
+    # 注：auto_split_by_markers 已经是 VideoParams 字段（model_dump 自动包含），
+    # 不需要再手动塞到 params dict。
     _scenes = st.session_state.get("custom_scenes") or []
     fields["params"]["custom_scenes"] = list(_scenes)  # 拷贝防止下游误改原 list
     fields["params"]["custom_scenes_enabled"] = bool(
@@ -2458,6 +2475,19 @@ if save_draft_btn or generate_btn:
                 pass
 
     logger.add(_log_to_disk, level="DEBUG")
+
+    # 「按 1./2./3. 切分」+「场景编排」两个开关都打开时，把两个会话级
+    # 字段（不在 VideoParams 模型里）也透传到 params，让 task.py 内的
+    # getattr 探测能拿到正确值。custom_scenes 在 _persist_uploads_and_scene
+    # 里以 video_materials 形式带过去了；这里补 auto_split_by_markers。
+    setattr(
+        params,
+        "auto_split_by_markers",
+        bool(
+            st.session_state.get("auto_split_by_markers")
+            and st.session_state.get("custom_scenes_enabled")
+        ),
+    )
 
     st.toast(tr("Generating Video"))
     logger.info(tr("Start Generating Video"))

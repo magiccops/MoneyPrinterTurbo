@@ -109,6 +109,10 @@ class VideoParams(BaseModel):
     paragraph_number: int = Field(default=1, ge=1, le=10)
     video_script_prompt: str = Field(default="", max_length=2000)
     custom_system_prompt: str = Field(default="", max_length=8000)
+    # 「🎬 场景编排」配套：用户在脚本里写 `1. xxx 2. xxx ...` 标记后，task.py
+    # 据此把整段 TTS 拆成 N 段独立生成、测每段时长注入到 scene.duration。
+    # 关闭时（默认）走整段 TTS 路径，行为与历史完全一致。
+    auto_split_by_markers: bool = False
 
 
 class SubtitleRequest(BaseModel):

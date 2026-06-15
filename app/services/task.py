@@ -1,8 +1,12 @@
 import math
 import os.path
 import re
+import subprocess
+from datetime import timedelta
 from os import path
 
+import edge_tts
+from edge_tts.submaker import Subtitle
 from loguru import logger
 
 from app.config import config
@@ -72,6 +76,131 @@ def save_script_data(task_id, video_script, video_terms, params):
         f.write(utils.to_json(script_data))
 
 
+def _concat_audio_files(segment_files, output_file):
+    """用 ffmpeg concat demuxer 把 N 段 mp3 拼接成一段。"""
+    list_file = output_file + ".concat.txt"
+    try:
+        with open(list_file, "w", encoding="utf-8") as f:
+            for seg in segment_files:
+                # 路径里有单引号会破坏 concat 语法；这里用绝对路径 + 双引号包裹。
+                f.write(f"file '{seg.replace(chr(39), chr(39) + chr(92) + chr(39))}'\n")
+        ffmpeg_binary = utils.get_ffmpeg_binary()
+        cmd = [
+            ffmpeg_binary,
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c", "copy",
+            output_file,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 or not os.path.exists(output_file):
+            raise RuntimeError(
+                f"ffmpeg concat audio failed (rc={result.returncode}): "
+                f"{(result.stderr or result.stdout or '').strip()[:500]}"
+            )
+    finally:
+        try:
+            os.remove(list_file)
+        except OSError:
+            pass
+
+
+def _merge_sub_makers(sub_makers, durations):
+    """把 N 个 SubMaker 合并成一个：cues 累加 offset（timedelta）。"""
+    if not sub_makers:
+        return None
+    has_cues = all(
+        hasattr(sm_obj, "cues") and getattr(sm_obj, "cues", None)
+        for sm_obj in sub_makers
+    )
+    if has_cues:
+        merged = edge_tts.SubMaker()
+        merged.type = getattr(sub_makers[0], "type", "WordBoundary")
+        offset_us = 0  # microseconds（timedelta 用 microseconds 表达）
+        idx = 0
+        for sm_obj, dur in zip(sub_makers, durations):
+            for cue in sm_obj.cues:
+                idx += 1
+                merged.cues.append(
+                    Subtitle(
+                        index=idx,
+                        start=cue.start + timedelta(microseconds=offset_us),
+                        end=cue.end + timedelta(microseconds=offset_us),
+                        content=cue.content,
+                    )
+                )
+            offset_us += int(max(dur, 0.0) * 1_000_000)
+        return merged
+    # legacy subs/offset 结构（项目里非 edge 路径仍使用）
+    merged_sm = voice.ensure_legacy_submaker_fields(edge_tts.SubMaker())
+    offset_100ns = 0
+    for sm_obj, dur in zip(sub_makers, durations):
+        for sub, (start, end) in zip(sm_obj.subs, sm_obj.offset):
+            merged_sm.subs.append(sub)
+            merged_sm.offset.append(
+                (start + offset_100ns, end + offset_100ns)
+            )
+        offset_100ns += int(max(dur, 0.0) * 10_000_000)
+    return merged_sm
+
+
+def _generate_audio_by_segments(task_id, params, segments, audio_file):
+    """N 段独立 TTS → 拼接 mp3 + 合并 SubMaker + 测每段时长。
+
+    返回 (audio_file, total_duration, merged_sub_maker, segment_durations)。
+    """
+    task_dir = utils.task_dir(task_id)
+    segment_files = []
+    segment_sub_makers = []
+    segment_durations = []
+    parsed_voice = voice.parse_voice_name(params.voice_name)
+
+    for i, seg in enumerate(segments):
+        seg_file = path.join(task_dir, f"audio_seg_{i:03d}.mp3")
+        sm_obj = voice.tts(
+            text=seg,
+            voice_name=parsed_voice,
+            voice_rate=params.voice_rate,
+            voice_file=seg_file,
+        )
+        if sm_obj is None:
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            logger.error(
+                f"segment TTS failed at index {i}: {seg[:50]!r}"
+            )
+            return None, None, None, None
+        # 优先用 sub_maker 拿时长（无 mp4 re-decode 开销），兜底读 mp3。
+        dur = voice.get_audio_duration(sm_obj)
+        if dur <= 0:
+            dur = voice.get_audio_duration(seg_file)
+        segment_files.append(seg_file)
+        segment_sub_makers.append(sm_obj)
+        segment_durations.append(float(dur))
+
+    # 拼接 N 段 mp3 → 最终 audio_file
+    try:
+        _concat_audio_files(segment_files, audio_file)
+    except Exception as concat_err:
+        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+        logger.error(f"ffmpeg concat audio failed: {concat_err}")
+        return None, None, None, None
+
+    # 合并 N 个 SubMaker
+    merged_sub_maker = _merge_sub_makers(segment_sub_makers, segment_durations)
+
+    total_duration = sum(segment_durations)
+    # 与整段路径一致：向上取整，避免 0 触发下游失败
+    total_duration_ceiled = math.ceil(total_duration) if total_duration > 0 else 0
+    logger.info(
+        f"segmented TTS done: {len(segments)} segments, "
+        f"durations={[round(d, 2) for d in segment_durations]}, "
+        f"total={total_duration_ceiled}s"
+    )
+    return audio_file, total_duration_ceiled, merged_sub_maker, segment_durations
+
+
 def generate_audio(task_id, params, video_script):
     '''
     Generate audio for the video script.
@@ -82,6 +211,8 @@ def generate_audio(task_id, params, video_script):
         - audio_file: path to the generated or provided audio file
         - audio_duration: duration of the audio in seconds
         - sub_maker: subtitle maker object if TTS is used, None otherwise
+        - scene_durations: list[float] 长度 = scene 数；仅在「按 1./2./3. 切分」
+          路径下非空（值 = 每段 TTS 实际时长），其他情况为 None
     '''
     logger.info("\n\n## generating audio")
     # /audio 和 /subtitle 请求模型不包含 custom_audio_file，
@@ -95,6 +226,36 @@ def generate_audio(task_id, params, video_script):
         else:
             logger.info("no custom audio file provided, using TTS to generate audio.")
         audio_file = path.join(utils.task_dir(task_id), "audio.mp3")
+
+        # ── 检测「按 1./2./3. 切分」条件 ───────────────────────
+        # 三个条件必须同时满足：
+        #   1. 用户在场景编排里勾选了 auto_split_by_markers
+        #   2. video_script 实际能被切出 N 段（>= 2）
+        #   3. 切出的段数 == 场景编排的 scene 数
+        # 否则 fallback 到整段 TTS（行为不变）。
+        scene_segments = None
+        if getattr(params, "auto_split_by_markers", False):
+            custom_scenes = getattr(params, "custom_scenes", None) or []
+            scene_segments = utils.split_script_by_markers(video_script)
+            if scene_segments and len(scene_segments) == len(custom_scenes):
+                logger.info(
+                    f"auto-split by markers: {len(scene_segments)} segments, "
+                    f"{len(custom_scenes)} scenes"
+                )
+            else:
+                logger.warning(
+                    "auto-split enabled but split result invalid: "
+                    f"segments={len(scene_segments) if scene_segments else 0}, "
+                    f"scenes={len(custom_scenes)}; "
+                    "fallback to single TTS"
+                )
+                scene_segments = None
+
+        if scene_segments:
+            return _generate_audio_by_segments(
+                task_id, params, scene_segments, audio_file
+            )
+
         sub_maker = voice.tts(
             text=video_script,
             voice_name=voice.parse_voice_name(params.voice_name),
@@ -109,21 +270,21 @@ def generate_audio(task_id, params, video_script):
 2. check if the network is available. If you are in China, it is recommended to use a VPN and enable the global traffic mode.
             """.strip()
             )
-            return None, None, None
+            return None, None, None, None
         audio_duration = math.ceil(voice.get_audio_duration(sub_maker))
         if audio_duration == 0:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
             logger.error("failed to get audio duration.")
-            return None, None, None
-        return audio_file, audio_duration, sub_maker
+            return None, None, None, None
+        return audio_file, audio_duration, sub_maker, None
     else:
         logger.info(f"using custom audio file: {custom_audio_file}")
         audio_duration = voice.get_audio_duration(custom_audio_file)
         if audio_duration == 0:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
             logger.error("failed to get audio duration from custom audio file.")
-            return None, None, None
-        return custom_audio_file, audio_duration, None
+            return None, None, None, None
+        return custom_audio_file, audio_duration, None, None
 
 def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     '''
@@ -327,7 +488,7 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=20)
 
     # 3. Generate audio
-    audio_file, audio_duration, sub_maker = generate_audio(
+    audio_file, audio_duration, sub_maker, scene_durations = generate_audio(
         task_id, params, video_script
     )
     if not audio_file:
