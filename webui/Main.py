@@ -1450,8 +1450,10 @@ llm_provider = config.app.get("llm_provider", "").lower()
 # ── 详情页：当前记录 + 顶部栏 + 历史视频预览 ──────────────────────
 # 「列表页 → 点击行 / 新建 / 复制」会把目标 id 写到 pending_record_id 并
 # 把 view 切到 detail。这里把它消费成 current_record_id（详情页编辑的
-# 目标），同时根据该记录往 session_state 回填表单初始值。整段只在该
-# id 非空时跑一次（rerun 之后 pending_record_id 已经被消费掉）。
+# 目标）。从该记录往 session_state 回填表单初始值只在「刚进入该 record」
+# 时跑一次，rerun 后不再覆盖——否则用户在 widget 里改完字段、触发 rerun
+# 又会被 record 里的旧值写回，看起来"改不动"（8dcc2a8 拆列表+详情时的
+# 回归 bug，所有详情页都受影响）。用 form_restored_for 守卫。
 _pending = st.session_state.get("pending_record_id")
 if _pending:
     st.session_state["current_record_id"] = _pending
@@ -1461,20 +1463,22 @@ _detail_rec_id = st.session_state.get("current_record_id")
 _detail_rec = (
     history_store.get_record(_detail_rec_id) if _detail_rec_id else None
 )
-if _detail_rec and isinstance(_detail_rec.get("params"), dict):
-    for _k, _v in _detail_rec["params"].items():
-        # 跳过 None / 复杂对象：widget key 期望的是 scalar 或简单 dict/list
-        if _v is None:
-            continue
-        try:
-            st.session_state[_k] = _v
-        except Exception:
-            pass
-    _vm = _detail_rec["params"].get("video_materials")
-    if isinstance(_vm, list):
-        st.session_state["local_video_materials"] = _vm
-    if _detail_rec["params"].get("custom_audio_file"):
-        st.session_state["custom_audio_file"] = _detail_rec["params"]["custom_audio_file"]
+if _detail_rec and st.session_state.get("form_restored_for") != _detail_rec.get("id"):
+    if isinstance(_detail_rec.get("params"), dict):
+        for _k, _v in _detail_rec["params"].items():
+            # 跳过 None / 复杂对象：widget key 期望的是 scalar 或简单 dict/list
+            if _v is None:
+                continue
+            try:
+                st.session_state[_k] = _v
+            except Exception:
+                pass
+        _vm = _detail_rec["params"].get("video_materials")
+        if isinstance(_vm, list):
+            st.session_state["local_video_materials"] = _vm
+        if _detail_rec["params"].get("custom_audio_file"):
+            st.session_state["custom_audio_file"] = _detail_rec["params"]["custom_audio_file"]
+    st.session_state["form_restored_for"] = _detail_rec.get("id")
 
 # 「🎬 场景编排」恢复：VideoParams 模型不含 custom_scenes，上面通用循环
 # 虽会写回 list/bool，但必须重新分配 scene id（场景卡 widget key 形如
