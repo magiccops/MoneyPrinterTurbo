@@ -1,7 +1,7 @@
 {
   "id": "hegu_acupoint",
   "name": "合谷穴科普（标准版）",
-  "description": "中医穴位短视频：定位 + 功效 + 按压 + 禁忌 4 段脚本，1080×1920 竖屏，启用场景编排（自动配 6 张文字卡 + 1 张解剖图）。",
+  "description": "中医穴位短视频：定位 + 功效 + 按压 + 禁忌 4 段脚本，1080×1920 竖屏，自动配 6 张场景卡（5 张文字 + 1 张解剖图占位）。\n\n【使用步骤】\n1. 点「使用」进入详情页，6 张 scene 已就位\n2. ⚠ 场景 3（图片场景）file_path 留空 —— 必须在场景卡片里上传手部解剖图，否则提交时该 scene 会被跳过\n3. 场景编排顶部「🎯 按总时长均分」输入预计音频总秒数（如 24）→ 点「均分给 6 段」一键对齐\n4. （可选）勾选「🔢 按 1./2./3. 自动切分」要求文案 6 段；本模板文案 4 段，开启会回退到整段 TTS\n5. 提交生成",
   "params": {
     "video_subject": "合谷穴",
     "video_script": "合谷穴，又称虎口穴，位于手背第一、二掌骨之间，拇、食指并拢时肌肉最高处。按摩合谷穴能缓解牙痛、头痛、咽喉肿痛，是常用的保健穴位。日常用拇指指腹按压，力度以酸胀为宜，每次三到五分钟。孕妇请勿按压，以免引起子宫收缩。",
@@ -37,5 +37,79 @@
     "subtitle_background_enabled": true,
     "text_background_color": "#000000",
     "rounded_subtitle_background": false
-  }
+  },
+  "scenes": [
+    {
+      "id": "00000000-0000-0000-0000-000000000001",
+      "type": "text",
+      "title": "合谷穴",
+      "body": "面口合谷收",
+      "bg_color": "#0F2A4A",
+      "title_color": "#FFD700",
+      "body_color": "#FFFFFF",
+      "accent_color": "#FF6B6B",
+      "title_size": 140,
+      "body_size": 72,
+      "duration": 4.0
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000002",
+      "type": "text",
+      "title": "位置",
+      "body": "手背第1、2掌骨间\n拇指食指并拢\n肌肉最高点",
+      "bg_color": "#5C0F1A",
+      "title_color": "#FFFFFF",
+      "body_color": "#FFFFFF",
+      "accent_color": "#FFD700",
+      "title_size": 140,
+      "body_size": 72,
+      "duration": 4.5
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000003",
+      "type": "image",
+      "file_path": "",
+      "original_name": "",
+      "duration": 4.0
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000004",
+      "type": "text",
+      "title": "功效",
+      "body": "牙痛  头痛\n咽喉肿痛  面瘫",
+      "bg_color": "#1A4A2E",
+      "title_color": "#FFFFFF",
+      "body_color": "#FFFFFF",
+      "accent_color": "#90EE90",
+      "title_size": 140,
+      "body_size": 72,
+      "duration": 4.0
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000005",
+      "type": "text",
+      "title": "按压",
+      "body": "拇指指腹按压\n力度以酸胀为宜\n每次3-5分钟",
+      "bg_color": "#0F2A4A",
+      "title_color": "#FFD700",
+      "body_color": "#FFFFFF",
+      "accent_color": "#FF6B6B",
+      "title_size": 140,
+      "body_size": 72,
+      "duration": 4.0
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000006",
+      "type": "text",
+      "title": "注意",
+      "body": "孕妇慎用\n以免引起子宫收缩",
+      "bg_color": "#3A0F0F",
+      "title_color": "#FFFFFF",
+      "body_color": "#FFFFFF",
+      "accent_color": "#FF4444",
+      "title_size": 140,
+      "body_size": 72,
+      "duration": 3.5
+    }
+  ]
 }
