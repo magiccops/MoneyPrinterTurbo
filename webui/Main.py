@@ -509,6 +509,68 @@ def _render_scene_editor() -> None:
                     st.toast(f"已均分：{n} 段 × {_per}s = {_per * n:.2f}s")
                     st.rerun()
 
+            # 「🤖 按文案自动算时长」：从主表单 video_script 里按标记切分
+            # （1./2./3.），逐段按字数 + 标点 + voice_rate 估算 TTS 朗读秒数，
+            # 写回每张 scene.duration。比"按总时长均分"更准——长短文案各自
+            # 对应不同停留时长，不会让短句被拖长、长句被截断。
+            # 启动条件：勾选了「按标记自动切分」+ 主表单 video_script 非空
+            #           + 切分段数 == 当前 scene 数
+            # 不满足条件时按钮置灰，给出原因提示。
+            with st.container(border=True):
+                st.markdown("**🤖 按文案自动算时长**")
+                _vs = ""
+                try:
+                    _vs = st.session_state.get("video_script", "") or ""
+                except Exception:
+                    _vs = ""
+                _auto_split_on = bool(
+                    st.session_state.get("auto_split_by_markers", False)
+                )
+                _segs = utils.split_script_by_markers(_vs) if _vs else None
+                _can_calc = bool(
+                    _auto_split_on
+                    and _segs
+                    and len(_segs) == n
+                )
+                if not _auto_split_on:
+                    st.caption(
+                        "⚠️ 需要先勾选上面的「按 1./2./3. 标记自动切分」"
+                    )
+                elif not _vs:
+                    st.caption("⚠️ 主表单 Video Script 为空")
+                elif not _segs:
+                    st.caption(
+                        "⚠️ Video Script 没识别到 1./2./3. 标记（需 N 段升序）"
+                    )
+                elif len(_segs) != n:
+                    st.caption(
+                        f"⚠️ 切出 {len(_segs)} 段，跟当前 {n} 张 scene 对不上"
+                    )
+                else:
+                    _vr = float(
+                        st.session_state.get("voice_rate", 1.0) or 1.0
+                    )
+                    _durs = utils.estimate_scene_durations(_segs, _vr)
+                    _sum = round(sum(_durs), 2)
+                    st.caption(
+                        f"文案共 {len(_segs)} 段，估算总时长 {_sum}s"
+                    )
+                    _btn_label = "🤖 写入（" + " / ".join(
+                        f"{d:.2f}s" for d in _durs
+                    ) + "）"
+                    if st.button(
+                        _btn_label,
+                        key="scene_io_auto_estimate_durations",
+                        use_container_width=True,
+                        disabled=not _can_calc,
+                    ):
+                        for _sc, _d in zip(scenes, _durs):
+                            _sc["duration"] = _d
+                        st.toast(
+                            f"已按文案估算：{n} 段总长 {_sum}s"
+                        )
+                        st.rerun()
+
             for i, sc in enumerate(list(scenes)):  # list() 防止中途修改
                 _render_scene_card(sc, i, n)
 
@@ -2340,9 +2402,35 @@ def _persist_uploads_and_scene(params, task_id):
         # task.py / video.py 会用它替代全局 video_clip_duration 来决定
         # 该 scene 实际停留时长（避免 N×clip 与 audio 错位）。
         # 没填 duration 的旧 scene 写成 0，由 video.py 端回退到全局值。
+        # 「🤖 自动覆盖」：勾选了「按 1./2./3. 标记自动切分」+ 主表单
+        # video_script 能切出 N 段（N == scene 数）时，用 utils 估算的
+        # TTS 时长直接覆盖用户填的 scene.duration。这是兜底——防止用户
+        # 忘了点「🤖 按文案自动算时长」按钮导致 UI 估算偏差大。
+        _scenes_ref = st.session_state["custom_scenes"]
+        _auto_durs = None
+        if (
+            st.session_state.get("auto_split_by_markers", False)
+            and len(_scenes_ref) == len(_scene_paths)
+        ):
+            _vs = (st.session_state.get("video_script") or "").strip()
+            _segs = utils.split_script_by_markers(_vs) if _vs else None
+            if _segs and len(_segs) == len(_scenes_ref):
+                _vr = float(
+                    st.session_state.get("voice_rate", 1.0) or 1.0
+                )
+                _auto_durs = utils.estimate_scene_durations(_segs, _vr)
+                logger.info(
+                    f"scene editor: auto-estimated per-scene durations: "
+                    f"{_auto_durs} (sum={sum(_auto_durs):.2f}s)"
+                )
         params.video_materials = []
-        for _sc, _path in zip(st.session_state["custom_scenes"], _scene_paths):
-            _dur = _sc.get("duration")
+        for _i, (_sc, _path) in enumerate(
+            zip(_scenes_ref, _scene_paths)
+        ):
+            if _auto_durs is not None:
+                _dur = _auto_durs[_i]
+            else:
+                _dur = _sc.get("duration")
             try:
                 _dur_int = max(0, int(round(float(_dur)))) if _dur else 0
             except (TypeError, ValueError):
