@@ -270,6 +270,11 @@ max_concurrent_tasks = 5
 # 并发任务已满后的最大排队任务数，超过后接口返回 429，避免匿名请求无限堆积
 max_queued_tasks = 100
 
+# 「场景编排 + 按 1./2./3. 自动切分」路径下，每段语音念完后到切下一场景之间的
+# 静音留白（秒）。默认 0.5：念完一段→静音 0.5s（画面停在当前场景）→切下一段
+# 并同时起下一段语音/字幕。设为 0 关闭段间留白，行为回到无 gap 拼接。
+scene_gap_seconds = 0.5
+
 
 [whisper]
 # Only effective when subtitle_provider is "whisper"

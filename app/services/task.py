@@ -149,10 +149,72 @@ def _concat_audio_files(segment_files, output_file):
             pass
 
 
-def _merge_sub_makers(sub_makers, durations):
-    """把 N 个 SubMaker 合并成一个：cues 累加 offset（timedelta）。"""
+def _concat_audio_files_with_gaps(segment_files, gap_seconds, output_file):
+    """拼接 N 段 mp3，段间插入 gap_seconds 静音。
+
+    对应「语音念完一段 → 静音 gap → 画面切到下一段 + 下一段语音起」的时间轴：
+    静音期间画面停在当前场景，gap 结束才切场。
+
+    用 concat demuxer + 重编码（统一 44100 mono libmp3lame）。各 TTS 段采样率
+    /声道可能不一致（edge 24k mono、azure/mimo 不同），直接 -c copy 会让静音
+    段变速或出现杂音；重编码统一后才稳，对 TTS 旁白音质影响可忽略。静音段用
+    voice.generate_silent_audio 生成一次，在 concat 列表里段间复用同一文件。
+    """
+    if not segment_files:
+        raise RuntimeError("no segment files to concat with gaps")
+
+    silence_file = output_file + ".silence.mp3"
+    if not voice.generate_silent_audio(gap_seconds, silence_file):
+        raise RuntimeError(
+            f"failed to generate inter-scene silence: {silence_file}"
+        )
+
+    list_file = output_file + ".concat.txt"
+    try:
+        with open(list_file, "w", encoding="utf-8") as f:
+            for i, seg in enumerate(segment_files):
+                # 路径里有单引号会破坏 concat 语法；与 _concat_audio_files 一致地转义。
+                safe_seg = seg.replace(chr(39), chr(39) + chr(92) + chr(39))
+                f.write(f"file '{safe_seg}'\n")
+                if i < len(segment_files) - 1:
+                    f.write(f"file '{silence_file}'\n")
+        ffmpeg_binary = utils.get_ffmpeg_binary()
+        cmd = [
+            ffmpeg_binary,
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_file,
+            "-c:a", "libmp3lame",
+            "-q:a", "4",
+            "-ar", "44100",
+            "-ac", "1",
+            output_file,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 or not os.path.exists(output_file):
+            raise RuntimeError(
+                f"ffmpeg concat audio with gaps failed (rc={result.returncode}): "
+                f"{(result.stderr or result.stdout or '').strip()[:500]}"
+            )
+    finally:
+        for tmp in (list_file, silence_file):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _merge_sub_makers(sub_makers, durations, gap_seconds=0.0):
+    """把 N 个 SubMaker 合并成一个：cues 累加 offset（timedelta）。
+
+    gap_seconds > 0 时，段与段之间插入该长度的静音——offset 在每段（除最后
+    一段，其后没有下一段）之后额外累加 gap，让后续段的字幕时间戳对齐「段间
+    留白」后的真实音频时间轴，保证字幕和带 gap 的音频同步。
+    """
     if not sub_makers:
         return None
+    gap_us = int(max(gap_seconds, 0.0) * 1_000_000)
     has_cues = all(
         hasattr(sm_obj, "cues") and getattr(sm_obj, "cues", None)
         for sm_obj in sub_makers
@@ -162,7 +224,8 @@ def _merge_sub_makers(sub_makers, durations):
         merged.type = getattr(sub_makers[0], "type", "WordBoundary")
         offset_us = 0  # microseconds（timedelta 用 microseconds 表达）
         idx = 0
-        for sm_obj, dur in zip(sub_makers, durations):
+        n = len(sub_makers)
+        for sm_idx, (sm_obj, dur) in enumerate(zip(sub_makers, durations)):
             for cue in sm_obj.cues:
                 idx += 1
                 merged.cues.append(
@@ -173,25 +236,37 @@ def _merge_sub_makers(sub_makers, durations):
                         content=cue.content,
                     )
                 )
+            # 段间留白：只有「后面还有下一段」时才把 gap 计入 offset。
             offset_us += int(max(dur, 0.0) * 1_000_000)
+            if sm_idx < n - 1:
+                offset_us += gap_us
         return merged
     # legacy subs/offset 结构（项目里非 edge 路径仍使用）
     merged_sm = voice.ensure_legacy_submaker_fields(edge_tts.SubMaker())
     offset_100ns = 0
-    for sm_obj, dur in zip(sub_makers, durations):
+    n = len(sub_makers)
+    for sm_idx, (sm_obj, dur) in enumerate(zip(sub_makers, durations)):
         for sub, (start, end) in zip(sm_obj.subs, sm_obj.offset):
             merged_sm.subs.append(sub)
             merged_sm.offset.append(
                 (start + offset_100ns, end + offset_100ns)
             )
         offset_100ns += int(max(dur, 0.0) * 10_000_000)
+        if sm_idx < n - 1:
+            offset_100ns += int(max(gap_seconds, 0.0) * 10_000_000)
     return merged_sm
 
 
 def _generate_audio_by_segments(task_id, params, segments, audio_file):
     """N 段独立 TTS → 拼接 mp3 + 合并 SubMaker + 测每段时长。
 
-    返回 (audio_file, total_duration, merged_sub_maker, segment_durations)。
+    段间插入 scene_gap_seconds（默认 0.5s）静音：语音念完一段后留白，画面在
+    静音期间停在当前场景，gap 结束才切到下一段并同时起下一段语音/字幕。
+
+    返回 (audio_file, total_duration, merged_sub_maker, scene_video_durations)。
+    scene_video_durations = 每段 TTS 时长 + gap（最后一段不加，没有「下一段」
+    可切），它会被 start() 透传给 get_video_materials / combine_videos，让每段
+    画面停留 = 该段语音时长 + 段间留白，与带 gap 的音频时间轴对齐。
     """
     task_dir = utils.task_dir(task_id)
     segment_files = []
@@ -221,26 +296,46 @@ def _generate_audio_by_segments(task_id, params, segments, audio_file):
         segment_sub_makers.append(sm_obj)
         segment_durations.append(float(dur))
 
-    # 拼接 N 段 mp3 → 最终 audio_file
-    try:
-        _concat_audio_files(segment_files, audio_file)
-    except Exception as concat_err:
-        sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
-        logger.error(f"ffmpeg concat audio failed: {concat_err}")
-        return None, None, None, None
+    # 段间留白（秒）。默认 0.5：念完一段→静音 0.5s→切下一段。设 0 关闭。
+    n = len(segments)
+    gap_seconds = float(config.app.get("scene_gap_seconds", 0.5) or 0.0)
 
-    # 合并 N 个 SubMaker
-    merged_sub_maker = _merge_sub_makers(segment_sub_makers, segment_durations)
+    if gap_seconds > 0 and n >= 2:
+        try:
+            _concat_audio_files_with_gaps(segment_files, gap_seconds, audio_file)
+        except Exception as concat_err:
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            logger.error(f"ffmpeg concat audio with gaps failed: {concat_err}")
+            return None, None, None, None
+        merged_sub_maker = _merge_sub_makers(
+            segment_sub_makers, segment_durations, gap_seconds
+        )
+        gap_total = gap_seconds * (n - 1)
+        # 每段画面停留 = 该段 TTS 时长 + 段间留白；最后一段无「下一段」可切，不加。
+        scene_video_durations = [
+            float(d) + gap_seconds for d in segment_durations[:-1]
+        ] + [float(segment_durations[-1])]
+    else:
+        try:
+            _concat_audio_files(segment_files, audio_file)
+        except Exception as concat_err:
+            sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
+            logger.error(f"ffmpeg concat audio failed: {concat_err}")
+            return None, None, None, None
+        merged_sub_maker = _merge_sub_makers(segment_sub_makers, segment_durations)
+        gap_total = 0.0
+        scene_video_durations = [float(d) for d in segment_durations]
 
-    total_duration = sum(segment_durations)
+    total_duration = sum(segment_durations) + gap_total
     # 与整段路径一致：向上取整，避免 0 触发下游失败
     total_duration_ceiled = math.ceil(total_duration) if total_duration > 0 else 0
     logger.info(
-        f"segmented TTS done: {len(segments)} segments, "
+        f"segmented TTS done: {n} segments, "
         f"durations={[round(d, 2) for d in segment_durations]}, "
-        f"total={total_duration_ceiled}s"
+        f"gap={gap_seconds}s, total={total_duration_ceiled}s, "
+        f"scene_video_durations={[round(d, 2) for d in scene_video_durations]}"
     )
-    return audio_file, total_duration_ceiled, merged_sub_maker, segment_durations
+    return audio_file, total_duration_ceiled, merged_sub_maker, scene_video_durations
 
 
 def generate_audio(task_id, params, video_script):
