@@ -366,21 +366,31 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
-def get_video_materials(task_id, params, video_terms, audio_duration):
+def get_video_materials(
+    task_id, params, video_terms, audio_duration, tts_scene_durations=None
+):
+    # ── 来源优先级 ──────────────────────────────────────────
+    # 1. TTS 实测分段时长（场景编排 + auto_split_by_markers 路径下，由
+    #    _generate_audio_by_segments 测出并由 start() 透传）—— 反映"语音真
+    #    的念这一段花了多少秒"，最准。
+    # 2. UI 在场景卡片里填的 material.duration（旧的本地素材路径）—— 估算值，
+    #    跟实际 TTS 时长常有偏差，仅在 TTS 没分段时兜底。
+    # 3. 全局 video_clip_duration（历史默认）—— 兜底兜底。
+    tts_durs = list(tts_scene_durations) if tts_scene_durations else None
+    ui_durs = [
+        float(m.duration) for m in params.video_materials if getattr(m, "duration", 0)
+    ]
+
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
-        # 场景编排路径下，每张 scene 携带自己的 duration（来自场景卡片 UI）；
-        # 把它们提取出来传给 preprocess_video，让 N 段加总 ≈ 音频总长，
+        # 优先 TTS 实测，缺则 UI 填的，N 段加总应 ≈ 音频总长。
         # 避免「N×clip_duration < audio_duration」触发 combine_videos 循环追加，
         # 造成"语音已读到下一段、画面还停在当前段"的错位。
-        # duration=0 的项（如历史 Pexels/Pixabay 路径）回退到全局 clip_duration。
-        per_scene_durations = [
-            float(m.duration) for m in params.video_materials if getattr(m, "duration", 0)
-        ]
+        per_scene_durations = tts_durs or ui_durs or None
         materials = video.preprocess_video(
             materials=params.video_materials,
             clip_duration=params.video_clip_duration,
-            durations=per_scene_durations or None,
+            durations=per_scene_durations,
         )
         if not materials:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
@@ -390,10 +400,32 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             return None
         return (
             [material_info.url for material_info in materials],
-            per_scene_durations or None,
+            per_scene_durations,
         )
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
+        # Pexels/Pixabay 路径下没有 per-scene 素材概念，但若 generate_audio 已经
+        # 测出 N 段 TTS 实测时长，把它们按 search_terms 数等比切分后传给
+        # download_videos，让每个 term 的累计抓取时长上限对齐 TTS 分段，
+        # combine_videos 收到的 max_clip_durations 跟单段 TTS 真实时长一致。
+        per_term_durations = None
+        if tts_durs and video_terms and len(video_terms) > 0:
+            n_terms = len(video_terms)
+            tts_total = sum(tts_durs)
+            if tts_total > 0 and len(tts_durs) == n_terms:
+                # 一一对应：TTS 第 i 段 = 第 i 个 term 的累计上限
+                per_term_durations = tts_durs
+                logger.info(
+                    f"per-term max durations (TTS measured): {per_term_durations}"
+                )
+            elif tts_total > 0:
+                # 数量不等：按比例把 TTS 总长摊到每个 term
+                per_term = tts_total / n_terms
+                per_term_durations = [per_term] * n_terms
+                logger.info(
+                    f"per-term max durations (proportional): {per_term_durations}"
+                )
+
         downloaded_videos = material.download_videos(
             task_id=task_id,
             search_terms=video_terms,
@@ -402,6 +434,7 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             video_contact_mode=params.video_concat_mode,
             audio_duration=audio_duration * params.video_count,
             max_clip_duration=params.video_clip_duration,
+            per_term_durations=per_term_durations,
         )
         if not downloaded_videos:
             sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)
@@ -409,7 +442,7 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
                 "failed to download videos, maybe the network is not available. if you are in China, please use a VPN."
             )
             return None
-        return downloaded_videos, None
+        return downloaded_videos, per_term_durations
 
 
 def generate_final_videos(
@@ -565,8 +598,11 @@ def start(task_id, params: VideoParams, stop_at: str = "video"):
     sm.state.update_task(task_id, state=const.TASK_STATE_PROCESSING, progress=40)
 
     # 5. Get video materials
+    # 透传 generate_audio 测出的「TTS 实测每段时长」（场景编排路径下非空），
+    # 让 get_video_materials 用真实语音时长决定每段画面停留时间，
+    # 避免 UI 填的 material.duration 跟实际 TTS 时长错位。
     downloaded_videos, scene_durations = get_video_materials(
-        task_id, params, video_terms, audio_duration
+        task_id, params, video_terms, audio_duration, scene_durations
     )
     if not downloaded_videos:
         sm.state.update_task(task_id, state=const.TASK_STATE_FAILED)

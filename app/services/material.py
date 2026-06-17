@@ -274,6 +274,7 @@ def download_videos(
     video_contact_mode: VideoConcatMode = VideoConcatMode.random,
     audio_duration: float = 0.0,
     max_clip_duration: int = 5,
+    per_term_durations: List[float] | None = None,
 ) -> List[str]:
     valid_video_items = []
     valid_video_urls = []
@@ -282,7 +283,16 @@ def download_videos(
     if source == "pixabay":
         search_videos = search_videos_pixabay
 
-    for search_term in search_terms:
+    # ── 按 term 累计时长上限（来自 TTS 实测分段） ──
+    # None → 行为不变（按 audio_duration + max_clip_duration）
+    # [t1, t2, t3] → 第 i 个 term 的累计抓取时长不能超过 per_term_durations[i]
+    #   超过就切下一个 term，全跑完还没填满 audio_duration 就让循环外层继续
+    #   按 max_clip_duration 兜底（保持向后兼容）。
+    per_term_caps = list(per_term_durations) if per_term_durations else None
+    # 按 term 分桶：每个 term 抓到的 item 放进自己桶，便于按 cap 切
+    per_term_items: List[List] = [[] for _ in search_terms]
+
+    for term_idx, search_term in enumerate(search_terms):
         video_items = search_videos(
             search_term=search_term,
             minimum_duration=max_clip_duration,
@@ -290,11 +300,23 @@ def download_videos(
         )
         logger.info(f"found {len(video_items)} videos for '{search_term}'")
 
+        term_cap = (
+            per_term_caps[term_idx]
+            if per_term_caps and term_idx < len(per_term_caps)
+            else None
+        )
+        term_accum = 0.0
         for item in video_items:
-            if item.url not in valid_video_urls:
-                valid_video_items.append(item)
-                valid_video_urls.append(item.url)
-                found_duration += item.duration
+            if item.url in valid_video_urls:
+                continue
+            per_term_items[term_idx].append(item)
+            valid_video_urls.append(item.url)
+            term_accum += item.duration
+            # term 桶填到 cap 就停，避免单 term 占太多画面时长
+            if term_cap and term_accum >= term_cap:
+                break
+
+        found_duration += term_accum
 
     # Fallback: 总命中数太少时用通用词补足，避免任务因素材不够短于音频而 break。
     if len(valid_video_items) < _FALLBACK_MIN_ITEMS:
@@ -327,7 +349,10 @@ def download_videos(
 
     concat_mode_value = getattr(video_contact_mode, "value", video_contact_mode)
     if concat_mode_value == VideoConcatMode.random.value:
-        random.shuffle(valid_video_items)
+        # 桶内各自 shuffle，但保持 term 顺序（与脚本分段顺序一致）
+        for bucket in per_term_items:
+            random.shuffle(bucket)
+        valid_video_items = [it for bucket in per_term_items for it in bucket]
 
     total_duration = 0.0
     for item in valid_video_items:
