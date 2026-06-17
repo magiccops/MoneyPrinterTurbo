@@ -506,6 +506,10 @@ def _render_scene_editor() -> None:
                     _per = round(float(_total) / n, 2)
                     for _sc in scenes:
                         _sc["duration"] = _per
+                        # slider 的 widget state 在 session_state[key] 里，
+                        # 单改 dict 不会让 slider 重新渲染时拿到新值。
+                        # 这里把值同步到 widget key，st.rerun 后 slider 才显示新值。
+                        st.session_state[f"scene_{_sc['id']}_duration"] = _per
                     st.toast(f"已均分：{n} 段 × {_per}s = {_per * n:.2f}s")
                     st.rerun()
 
@@ -566,6 +570,11 @@ def _render_scene_editor() -> None:
                     ):
                         for _sc, _d in zip(scenes, _durs):
                             _sc["duration"] = _d
+                            # 同步写到 slider 的 widget state，
+                            # 否则 st.rerun 后 slider 仍显示旧值（详见 scene_io_distribute_durations）
+                            st.session_state[
+                                f"scene_{_sc['id']}_duration"
+                            ] = _d
                         st.toast(
                             f"已按文案估算：{n} 段总长 {_sum}s"
                         )
